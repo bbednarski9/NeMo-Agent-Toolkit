@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,6 @@
 import inspect
 import types
 from dataclasses import dataclass
-from typing import Union
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -51,7 +50,7 @@ class TestResolveType:
 
     def test_resolve_union_type(self):
         """Test resolving Union types."""
-        union_type = Union[str, None]
+        union_type = str | None
         result = resolve_type(union_type)
         # For typing.Union, returns the original unchanged since it only handles types.UnionType
         assert result == union_type
@@ -70,7 +69,7 @@ class TestResolveType:
 
     def test_resolve_complex_union(self):
         """Test resolving union with multiple non-None types."""
-        union_type = Union[str, int, None]
+        union_type = str | int | None
         result = resolve_type(union_type)
         # For typing.Union, the function returns the original type unchanged
         # since it only handles types.UnionType (PEP 604 style)
@@ -78,7 +77,7 @@ class TestResolveType:
 
     def test_resolve_all_none_union(self):
         """Test resolving union with only None types."""
-        union_type = Union[None, type(None)]
+        union_type = None | type(None)
         result = resolve_type(union_type)
         # Should return the original type if no non-None found
         assert result == union_type
@@ -136,6 +135,7 @@ class TestAutoGenToolWrapper:
 
     def test_autogen_tool_wrapper_no_description(self, mock_function, mock_builder):
         """Test tool wrapper with no description."""
+        _ = mock_builder  # Unused in this test
         mock_function.description = None
 
         with patch('nat.plugins.autogen.tool_wrapper.FunctionTool') as mock_function_tool:
@@ -291,9 +291,8 @@ class TestTypeResolution:
 
     def test_resolve_type_with_optional(self):
         """Test resolve_type with Optional types."""
-        from typing import Optional
 
-        optional_str = Optional[str]  # This is Union[str, None]
+        optional_str = str | None
         result = resolve_type(optional_str)
         # For typing.Union (which Optional[str] is), returns the original unchanged
         assert result == optional_str

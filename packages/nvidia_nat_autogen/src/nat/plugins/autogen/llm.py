@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""AutoGen LLM client registrations for NAT."""
 
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 from typing import TypeVar
 
 from nat.builder.builder import Builder
@@ -35,7 +37,15 @@ ModelType = TypeVar("ModelType")
 
 
 def _patch_autogen_client_based_on_config(client: ModelType, llm_config: LLMBaseConfig) -> ModelType:
-    """Patch AutoGen client with NAT mixins (retry, thinking)."""
+    """Patch AutoGen client with NAT mixins (retry, thinking).
+
+    Args:
+        client (ModelType): The AutoGen LLM client to patch.
+        llm_config (LLMBaseConfig): The LLM configuration containing mixin settings.
+
+    Returns:
+        ModelType: The patched AutoGen LLM client.
+    """
 
     from autogen_core.models import SystemMessage
 
@@ -54,12 +64,12 @@ def _patch_autogen_client_based_on_config(client: ModelType, llm_config: LLMBase
         """
 
         @override
-        def inject(self, messages: list, *args, **kwargs) -> FunctionArgumentWrapper:
+        def inject(self, messages: list, *args: Any, **kwargs: Any) -> FunctionArgumentWrapper:
             """Inject thinking system prompt into AutoGen messages.
             Args:
                 messages (list): List of AutoGen messages (UserMessage, AssistantMessage, SystemMessage
-                *args: Additional positional arguments
-                **kwargs: Additional keyword arguments
+                *args (Any): Additional positional arguments
+                **kwargs (Any): Additional keyword arguments
 
             Returns:
                 FunctionArgumentWrapper: Wrapper containing modified args and kwargs
@@ -99,7 +109,7 @@ async def openai_autogen(llm_config: OpenAIModelConfig, _builder: Builder) -> As
         _builder (Builder): NAT builder instance
 
     Yields:
-        Configured AutoGen OpenAI client
+        AsyncGenerator[ModelType, None]: Configured AutoGen OpenAI client
     """
     from autogen_core.models import ModelFamily
     from autogen_core.models import ModelInfo
@@ -142,7 +152,7 @@ async def azure_openai_autogen(llm_config: AzureOpenAIModelConfig,
         _builder (Builder): NAT builder instance
 
     Yields:
-        Configured AutoGen Azure OpenAI client
+        AsyncGenerator[ModelType, None]: Configured AutoGen Azure OpenAI client
     """
     from autogen_core.models import ModelFamily
     from autogen_core.models import ModelInfo

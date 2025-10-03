@@ -116,14 +116,14 @@ class AutoGenProfilerHandler(BaseProfilerCallback):
         """
         original_func = self._original_llm_call
 
-        async def wrapped_llm_call(*args, **kwargs) -> Any:
+        async def wrapped_llm_call(*args: Any, **kwargs: Any) -> Any:
             """
             Replicates ChatCompletionClient.create(...) logic without wrapt: collects usage stats,
             calls the original, and captures output stats.
 
             Args:
-                *args: Positional arguments to the LLM call.
-                **kwargs: Keyword arguments to the LLM call.
+                *args (Any): Positional arguments to the LLM call.
+                **kwargs (Any): Keyword arguments to the LLM call.
 
             Returns:
                 Any: The result of the LLM call.
@@ -238,17 +238,20 @@ class AutoGenProfilerHandler(BaseProfilerCallback):
     def _tool_call_monkey_patch(self) -> Callable[..., Any]:
         """
         Returns a function that wraps calls to BaseTool.run_json(...) with usage-logging.
+
+        Returns:
+            Callable[..., Any]: The wrapped function.
         """
         original_func = self._original_tool_call
 
-        async def wrapped_tool_call(*args, **kwargs) -> Any:
+        async def wrapped_tool_call(*args: Any, **kwargs: Any) -> Any:
             """
             Replicates BaseTool.run_json(...) logic without wrapt: collects usage stats,
             calls the original, and captures output stats.
 
             Args:
-                *args: Positional arguments to the tool call.
-                **kwargs: Keyword arguments to the tool call.
+                *args (Any): Positional arguments to the tool call.
+                **kwargs (Any): Keyword arguments to the tool call.
 
             Returns:
                 Any: The result of the tool call.

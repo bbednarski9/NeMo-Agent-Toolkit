@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import logging
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from pydantic import Field
 
@@ -26,7 +26,7 @@ from nat.data_models.component_ref import LLMRef
 from nat.data_models.function import FunctionBaseConfig
 
 # from . import nat_time_mcp_tool  # noqa: F401 # pylint: disable=W0611     #imported for side effects (registration)
-# from . import weather_update_tool  # noqa: F401 # pylint: disable=W0611     #imported for side effects (registration)
+from . import weather_update_tool  # noqa: F401 # pylint: disable=W0611     #imported for side effects (registration)
 
 logger = logging.getLogger(__name__)
 

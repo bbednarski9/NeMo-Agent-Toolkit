@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,6 +67,9 @@ def autogen_tool_wrapper(
         name (str): The name of the tool.
         fn (Function): The NAT function to wrap.
         _builder (Builder): The NAT workflow builder to access registered components.
+
+    Returns:
+        Any: The AutoGen FunctionTool wrapping the NAT function.
     """
 
     import inspect
@@ -86,8 +89,8 @@ def autogen_tool_wrapper(
         """Async generator to stream results from the NAT function.
 
         Args:
-            *args: Positional arguments to pass to the NAT function.
-            **kwargs: Keyword arguments to pass to the NAT function.
+            *args (Any): Positional arguments to pass to the NAT function.
+            **kwargs (Any): Keyword arguments to pass to the NAT function.
         Yields:
             Any: Streamed items from the NAT function.
         """

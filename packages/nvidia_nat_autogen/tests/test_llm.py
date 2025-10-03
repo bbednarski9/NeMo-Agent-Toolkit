@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -33,7 +34,7 @@ class TestRetryConfig(LLMBaseConfig, RetryMixin):
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
-    retry_on_errors: list = ["timeout"]
+    retry_on_errors: list[Any] | None = ["timeout"]
 
 
 class TestThinkingConfig(LLMBaseConfig, ThinkingMixin):
@@ -47,7 +48,7 @@ class TestCombinedConfig(LLMBaseConfig, RetryMixin, ThinkingMixin):
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
-    retry_on_errors: list = ["timeout"]
+    retry_on_errors: list[Any] | None = ["timeout"]
     thinking_system_prompt: str = "Think step by step"
 
 
@@ -213,6 +214,17 @@ class TestLLMClientFunctions:
         mock_model_info = Mock()
 
         def import_side_effect(name, *args, **kwargs):
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *args: Additional positional arguments.
+                **kwargs: Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
+            _, _ = args, kwargs  # Unused
             if 'autogen_ext.models.openai' in name:
                 mock_module = Mock()
                 mock_module.OpenAIChatCompletionClient = Mock(return_value=mock_client)

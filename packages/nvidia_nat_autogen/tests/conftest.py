@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,16 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Conftest for testing """
+import sys
+from unittest.mock import Mock
 
 import pytest
 
 
 @pytest.fixture
-def mock_autogen_imports():
-    """Mock AutoGen imports for testing."""
-    import sys
-    from unittest.mock import Mock
+def mock_autogen_imports() -> dict:
+    """Mock AutoGen imports for testing.
 
+    Yields:
+        dict: Dictionary of mocked AutoGen modules.
+    """
     # Mock autogen modules
     autogen_core = Mock()
     autogen_core.tools = Mock()

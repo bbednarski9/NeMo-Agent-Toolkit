@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,8 +92,12 @@ class TestAutoGenProfilerHandler:
         assert handler.last_call_ts > original_ts
 
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
-    def test_step_manager_property(self, mock_get):
-        """Test step_manager property access."""
+    def test_step_manager_property(self, mock_get: Mock):
+        """Test step_manager property access.
+
+        Args:
+            mock_get (Mock): Mock for Context.get method.
+        """
         mock_context = Mock()
         mock_step_manager = Mock()
         mock_context.intermediate_step_manager = mock_step_manager
@@ -117,7 +121,6 @@ class TestAutoGenProfilerHandler:
         original_ts = handler.last_call_ts
 
         # Update timestamp
-        import time
         time.sleep(0.001)  # Small delay to ensure timestamp changes
         handler.last_call_ts = time.time()
 
@@ -136,7 +139,12 @@ class TestAutoGenProfilerHandler:
 
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
     def test_successful_instrumentation(self, mock_logger):
-        """Test successful instrumentation path."""
+        """Test successful instrumentation path.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+        """
+        _ = mock_logger  # Unused in this test
         handler = AutoGenProfilerHandler()
 
         with patch('builtins.__import__') as mock_import:
@@ -171,7 +179,11 @@ class TestAutoGenProfilerHandler:
 
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
     def test_successful_uninstrumentation(self, mock_logger):
-        """Test successful uninstrumentation path."""
+        """Test successful uninstrumentation path.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+        """
         handler = AutoGenProfilerHandler()
         handler._instrumented = True  # pylint: disable=protected-access
 
@@ -234,9 +246,15 @@ class TestLLMCallMonkeyPatch:
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
-    async def test_llm_wrapped_call_basic_flow(self, mock_logger, mock_get):
-        """Test basic LLM wrapped call flow."""
+    async def test_llm_wrapped_call_basic_flow(self, mock_logger: Mock, mock_get: Mock):
+        """Test basic LLM wrapped call flow.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+            mock_get (Mock): Mock for Context.get method.
+        """
         # Setup mocks
+        _ = mock_logger  # Unused in this test
         mock_context = Mock()
         mock_step_manager = Mock()
         mock_context.intermediate_step_manager = mock_step_manager
@@ -275,8 +293,13 @@ class TestLLMCallMonkeyPatch:
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
-    async def test_llm_wrapped_call_with_exception(self, mock_logger, mock_get):
-        """Test LLM wrapped call with exception handling."""
+    async def test_llm_wrapped_call_with_exception(self, mock_logger: Mock, mock_get: Mock):
+        """Test LLM wrapped call with exception handling.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+            mock_get (Mock): Mock for Context.get method.
+        """
         # Setup mocks
         mock_context = Mock()
         mock_step_manager = Mock()
@@ -307,8 +330,12 @@ class TestLLMCallMonkeyPatch:
 
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
-    async def test_llm_wrapped_call_model_name_fallback(self, mock_get):
-        """Test model name fallback when _raw_config fails."""
+    async def test_llm_wrapped_call_model_name_fallback(self, mock_get: Mock):
+        """Test model name fallback when _raw_config fails.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+        """
         # Setup mocks
         mock_context = Mock()
         mock_step_manager = Mock()
@@ -343,8 +370,12 @@ class TestLLMCallMonkeyPatch:
 
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
-    async def test_llm_wrapped_call_complex_content(self, mock_get):
-        """Test LLM wrapped call with complex message content."""
+    async def test_llm_wrapped_call_complex_content(self, mock_get: Mock):
+        """Test LLM wrapped call with complex message content.
+
+        Args:
+            mock_get (Mock): Mock for Context.get method.
+        """
         # Setup mocks
         mock_context = Mock()
         mock_step_manager = Mock()
@@ -391,8 +422,12 @@ class TestToolCallMonkeyPatch:
 
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
-    async def test_tool_wrapped_call_basic_flow(self, mock_get):
-        """Test basic tool wrapped call flow."""
+    async def test_tool_wrapped_call_basic_flow(self, mock_get: Mock):
+        """Test basic tool wrapped call flow.
+
+        Args:
+            mock_get (Mock): Mock for Context.get method.
+        """
         # Setup mocks
         mock_context = Mock()
         mock_step_manager = Mock()
@@ -425,8 +460,13 @@ class TestToolCallMonkeyPatch:
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
-    async def test_tool_wrapped_call_with_exception(self, mock_logger, mock_get):
-        """Test tool wrapped call with exception handling."""
+    async def test_tool_wrapped_call_with_exception(self, mock_logger: Mock, mock_get: Mock):
+        """Test tool wrapped call with exception handling.
+
+        Args:
+            mock_logger (Mock): Mock for the logger.
+            mock_get (Mock): Mock for Context.get method.
+        """
         # Setup mocks
         mock_context = Mock()
         mock_step_manager = Mock()
@@ -456,7 +496,7 @@ class TestToolCallMonkeyPatch:
 
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
-    async def test_tool_wrapped_call_various_input_formats(self, mock_get):
+    async def test_tool_wrapped_call_various_input_formats(self, mock_get: Mock):
         """Test tool wrapped call with various input formats."""
         # Setup mocks
         mock_context = Mock()
@@ -488,7 +528,7 @@ class TestErrorHandlingPaths:
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
-    async def test_llm_model_name_error_handling(self, mock_logger, mock_get):
+    async def test_llm_model_name_error_handling(self, mock_logger: Mock, mock_get: Mock):
         """Test error handling when getting model name fails."""
         # Setup mocks
         mock_context = Mock()
@@ -535,7 +575,7 @@ class TestErrorHandlingPaths:
     @pytest.mark.asyncio
     @patch('nat.plugins.autogen.autogen_callback_handler.Context.get')
     @patch('nat.plugins.autogen.autogen_callback_handler.logger')
-    async def test_llm_input_processing_error(self, mock_logger, mock_get):
+    async def test_llm_input_processing_error(self, mock_logger: Mock, mock_get: Mock):
         """Test error handling in input processing."""
         # Setup mocks
         mock_context = Mock()

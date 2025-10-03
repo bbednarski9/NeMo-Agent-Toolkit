@@ -78,19 +78,17 @@ nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --
 ```console
 (.venv)
 [12:44] BASH_$
- > nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --input "What is the weather and time in Tokyo today?"
-12:44:06 - LiteLLM:INFO: cost_calculator.py:588 - selected model name for cost calculation: openai/gpt-4.1-2025-04-14
-2025.09.19_12:44:06 || INFO     || LiteLLM:588 :: selected model name for cost calculation: openai/gpt-4.1-2025-04-14
-selected model name for cost calculation: openai/gpt-4.1-2025-04-14
+ > nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --input "What is the weather and time in New York today?"
+
 2025.09.19_12:44:06 || INFO     || nat.front_ends.console.console_front_end_plugin:96 ::
 --------------------------------------------------
 Workflow Result:
-['Today in Tokyo:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
+['Today in New York:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
 --------------------------------------------------
 
 --------------------------------------------------
 Workflow Result:
-['Today in Tokyo:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
+['Today in New York:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
 --------------------------------------------------
 
 (.venv)
