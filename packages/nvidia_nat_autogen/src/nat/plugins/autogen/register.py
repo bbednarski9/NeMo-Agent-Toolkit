@@ -13,14 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
+# flake8: noqa
+# isort:skip_file
+"""AutoGen plugin registration for NAT components."""
 
-
-class LLMFrameworkEnum(str, Enum):
-    LANGCHAIN = "langchain"
-    LLAMA_INDEX = "llama_index"
-    CREWAI = "crewai"
-    SEMANTIC_KERNEL = "semantic_kernel"
-    AGNO = "agno"
-    ADK = "adk"
-    AUTOGEN = "autogen"
+from . import llm
+from . import tool_wrapper
