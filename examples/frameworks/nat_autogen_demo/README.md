@@ -43,18 +43,12 @@ uv pip install -e examples/frameworks/nat_autogen_demo
 
 ### Set up API keys
 
-LiteLLM routes to many providers. For OpenAI:
+For OpenAI:
 ```bash
 export OPENAI_API_KEY="<your_openai_key>"
 # Optional (defaults to https://api.openai.com/v1 if unset)
 export OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
 ```
-For Azure OpenAI, set:
-```bash
-export OPENAI_API_KEY="<your_azure_openai_key>"
-export OPENAI_API_BASE="https://<your-azure-endpoint>/openai"
-```
-You can find LLM provider specific instructions in the LiteLLM documentation. Please set the appropriate environment variables.
 
 ### Run the Workflow
 

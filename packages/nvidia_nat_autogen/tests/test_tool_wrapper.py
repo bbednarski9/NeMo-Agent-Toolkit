@@ -202,7 +202,6 @@ class TestNatFunctionDecorator:
 
         def test_func():
             """Test function."""
-            pass
 
         # Mock the decorator pattern from the source
         name = "test_name"

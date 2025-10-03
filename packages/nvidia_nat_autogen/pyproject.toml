@@ -48,3 +48,4 @@ nvidia-nat = { workspace = true }
 
 [project.entry-points.'nat.components']
 nat_autogen = "nat.plugins.autogen.register"
+nat_autogen_tools = "nat.plugins.autogen.tools.register"
