@@ -241,9 +241,12 @@ class TestLLMClientFunctions:
         mock_builder = Mock()
 
         # Test the async context manager
-        async with openai_autogen(config, mock_builder) as client:
-            # Just verify we got a client back without errors
-            assert client is not None
+        gen = openai_autogen(config, mock_builder)
+        client = await gen.__anext__()
+
+        assert client is not None
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
 
     @pytest.mark.asyncio
     @patch('builtins.__import__')
@@ -256,9 +259,19 @@ class TestLLMClientFunctions:
         mock_model_info = Mock()
 
         def import_side_effect(name, *args, **kwargs):
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *args: Additional positional arguments.
+                **kwargs: Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
             if 'autogen_ext.models.openai' in name:
                 mock_module = Mock()
-                mock_module.AzureOpenAIChatCompletionClient = Mock(return_value=mock_client)
+                mock_module.OpenAIChatCompletionClient = Mock(return_value=mock_client)
                 return mock_module
             elif 'autogen_core.models' in name:
                 mock_module = Mock()
@@ -289,7 +302,17 @@ class TestLLMClientFunctions:
         mock_client = Mock()
         mock_model_info = Mock()
 
-        def import_side_effect(name, *args, **kwargs):
+        def import_side_effect(name, *args: Any, **kwargs: Any) -> Mock:
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *args (Any): Additional positional arguments.
+                **kwargs (Any): Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
             if 'autogen_ext.models.openai' in name:
                 mock_module = Mock()
                 mock_module.OpenAIChatCompletionClient = Mock(return_value=mock_client)

@@ -138,12 +138,17 @@ def autogen_tool_wrapper(
             annotations: dict[str, Any] = {}
 
             if input_schema is not None:
-                annotations = getattr(input_schema, "__annotations__", {}) or {}
-                for param_name, param_annotation in annotations.items():
-                    resolved_type = resolve_type(param_annotation)
+                annotations = {}
+                params = []
+                model_fields = getattr(input_schema, "model_fields", {})
+                for param_name, model_field in model_fields.items():
+                    resolved_type = resolve_type(model_field.annotation)
+                    default = model_field.default if model_field.is_required() is False else inspect._empty
                     params.append(
-                        inspect.Parameter(param_name, inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                          annotation=resolved_type))
+                        inspect.Parameter(param_name,
+                                          inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                          annotation=resolved_type,
+                                          default=default))
                     annotations[param_name] = resolved_type
             setattr(func_to_wrap, "__signature__", inspect.Signature(parameters=params))
             setattr(func_to_wrap, "__annotations__", annotations)

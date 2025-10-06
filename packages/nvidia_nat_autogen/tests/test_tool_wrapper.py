@@ -142,6 +142,7 @@ class TestAutoGenToolWrapper:
             mock_tool = Mock()
             mock_function_tool.return_value = mock_tool
 
+            autogen_tool_wrapper("test_tool", mock_function, mock_builder)
             call_args = mock_function_tool.call_args
             assert call_args[1]['description'] == "No description provided."
 

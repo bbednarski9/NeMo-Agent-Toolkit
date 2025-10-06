@@ -37,18 +37,15 @@ If you have not already done so, follow the instructions in the [Install Guide](
 From the root directory of the NAT library, run the following commands:
 
 ```bash
-uv pip install -e '.[autogen]' --prerelease=allow
+uv pip install -e '.[autogen]'
 uv pip install -e examples/frameworks/nat_autogen_demo
 ```
 
 ### Set up API keys
-
-For OpenAI:
-```bash
-export OPENAI_API_KEY="<your_openai_key>"
-# Optional (defaults to https://api.openai.com/v1 if unset)
-export OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
-```
+For OpenAI Export these:
+- OPENAI_MODEL_NAME
+- OPENAI_API_KEY
+- OPENAI_API_BASE
 
 ### Run the Workflow
 
@@ -70,9 +67,7 @@ nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --
 ### Expected output
 
 ```console
-(.venv)
 [12:44] BASH_$
- > nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --input "What is the weather and time in New York today?"
 
 2025.09.19_12:44:06 || INFO     || nat.front_ends.console.console_front_end_plugin:96 ::
 --------------------------------------------------
