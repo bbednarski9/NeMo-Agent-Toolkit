@@ -10,10 +10,10 @@ root = "../../.."
 name = "nat_autogen_demo"
 dynamic = ["version"]
 dependencies = [
+  "autogen-agentchat~=0.7",
+  "autogen-core~=0.7",
+  "autogen-ext~=0.7",
   "nvidia-nat[autogen]~=1.4",
-  "autogen-core~=0.7.0",
-  "autogen-agentchat~=0.7.0",
-  "autogen-ext~=0.7.0",
 ]
 requires-python = ">=3.11,<3.14"
 description = "AutoGen Workflow Example"
