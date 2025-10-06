@@ -33,6 +33,10 @@ class AutoGenFunctionConfig(FunctionBaseConfig, name="autogen_team"):
 
     llm_name: LLMRef = Field(description="The LLM model to use with AutoGen agents.")
     tool_names: list[str] = Field(default_factory=list, description="List of tool names to be used by the agents.")
+    mcp_server_url: str = Field(
+        default="http://0.0.0.0:9901/mcp",
+        description="URL for the MCP time server.",
+    )
 
 
 @register_function(config_type=AutoGenFunctionConfig, framework_wrappers=[LLMFrameworkEnum.AUTOGEN])
@@ -60,7 +64,7 @@ async def autogen_team(config: AutoGenFunctionConfig, builder: Builder) -> Async
         tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.AUTOGEN)
 
         time_server_params = StreamableHttpServerParams(
-            url="http://0.0.0.0:9901/mcp",
+            url=config.mcp_server_url,
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
@@ -74,14 +78,14 @@ async def autogen_team(config: AutoGenFunctionConfig, builder: Builder) -> Async
             system_message="You are an agent that provides the current weather and time information. "
             "When asked about the weather, provide the current weather conditions. "
             "When asked about the time, provide the current local time. "
-            "If asked about anything else, respond with 'I can only provide weather and time information.'"
-            "Once you are done, reply with the text 'DONE'")
+            "If asked about anything else, respond with 'I can only provide weather and time information.' "
+            "Once you are done, reply with the text 'DONE'.")
         final_response_agent = AssistantAgent(
             name="FinalResponseAgent",
             model_client=llm_client,
             system_message="You are the final response agent. Your role is to provide a concise and clear answer "
-            "based on the information provided by other agents."
-            "Once you are done, reply with the final answer and then say 'APPROVE'")
+            "based on the information provided by other agents. "
+            "Once you are done, reply with the final answer and then say 'APPROVE'.")
 
         team = RoundRobinGroupChat(participants=[weather_time_agent, final_response_agent],
                                    termination_condition=TextMentionTermination("APPROVE"))
@@ -100,12 +104,12 @@ async def autogen_team(config: AutoGenFunctionConfig, builder: Builder) -> Async
 
                 if hasattr(result, 'messages') and result.messages:
                     return result.messages[-1].content
-
-                return "The workflow finished but no output was generated."
+                else:
+                    return "The workflow finished but no output was generated."
 
             except Exception as e:
                 logger.exception("Error in AutoGen workflow")
-                return f"Error occurred during AutoGen workflow: {str(e)}"
+                return f"Error occurred during AutoGen workflow: {e!s}"
 
         # Yield the function info
         yield FunctionInfo.create(single_fn=_autogen_team_workflow)

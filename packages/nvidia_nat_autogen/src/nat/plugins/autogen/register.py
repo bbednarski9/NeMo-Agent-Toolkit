@@ -17,5 +17,5 @@
 # isort:skip_file
 """AutoGen plugin registration for NAT components."""
 
-from . import llm
-from . import tool_wrapper
+from . import llm  # noqa: F401 # pylint: disable=W0611     #imported for side effects (registration)
+from . import tool_wrapper  # noqa: F401 # pylint: disable=W0611     #imported for side effects (registration)

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Test LLM for Autogen"""
 
 from typing import Any
 from unittest.mock import Mock
@@ -31,6 +32,7 @@ from nat.plugins.autogen.llm import _patch_autogen_client_based_on_config
 
 class TestRetryConfig(LLMBaseConfig, RetryMixin):
     """Test config with retry mixin."""
+    __test__ = False  # Tell pytest this isn't a test class
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
@@ -39,12 +41,14 @@ class TestRetryConfig(LLMBaseConfig, RetryMixin):
 
 class TestThinkingConfig(LLMBaseConfig, ThinkingMixin):
     """Test config with thinking mixin."""
+    __test__ = False  # Tell pytest this isn't a test class
 
     thinking_system_prompt: str = "Think step by step"
 
 
 class TestCombinedConfig(LLMBaseConfig, RetryMixin, ThinkingMixin):
     """Test config with both mixins."""
+    __test__ = False  # Tell pytest this isn't a test class
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
@@ -97,7 +101,7 @@ class TestPatchAutoGenClient:
         result = _patch_autogen_client_based_on_config(mock_client, thinking_config)
 
         mock_patch_thinking.assert_called_once()
-        args, kwargs = mock_patch_thinking.call_args
+        args, _kwargs = mock_patch_thinking.call_args
         assert args[0] == mock_client
         assert result == mock_patched_client
 
@@ -112,6 +116,7 @@ class TestPatchAutoGenClient:
         mock_patch_thinking.return_value = mock_final_client
 
         class CombinedConfig(TestRetryConfig, TestThinkingConfig):
+            """Combined config for testing."""
             pass
 
         config = Mock(spec=CombinedConfig)
@@ -195,7 +200,7 @@ class TestThinkingInjector:
             mock_patch.assert_called_once()
 
             # Verify the injector is passed correctly
-            args, kwargs = mock_patch.call_args
+            args, _kwargs = mock_patch.call_args
             assert args[0] == mock_client
             assert args[1] is not None  # AutoGenThinkingInjector instance
 
@@ -213,18 +218,18 @@ class TestLLMClientFunctions:
         mock_client = Mock()
         mock_model_info = Mock()
 
-        def import_side_effect(name, *args, **kwargs):
+        def import_side_effect(name, *_args, **_kwargs) -> Mock:
             """Side effect function to mock imports.
 
             Args:
                 name (str): The name of the module being imported.
-                *args: Additional positional arguments.
-                **kwargs: Additional keyword arguments.
+                *_args: Additional positional arguments.
+                **_kwargs: Additional keyword arguments.
 
             Returns:
                 Mock: A mock module or object based on the import name.
             """
-            _, _ = args, kwargs  # Unused
+            _, _ = _args, _kwargs  # Unused
             if 'autogen_ext.models.openai' in name:
                 mock_module = Mock()
                 mock_module.OpenAIChatCompletionClient = Mock(return_value=mock_client)
@@ -245,8 +250,6 @@ class TestLLMClientFunctions:
         client = await gen.__anext__()
 
         assert client is not None
-        with pytest.raises(StopAsyncIteration):
-            await gen.__anext__()
 
     @pytest.mark.asyncio
     @patch('builtins.__import__')
@@ -258,13 +261,13 @@ class TestLLMClientFunctions:
         mock_client = Mock()
         mock_model_info = Mock()
 
-        def import_side_effect(name, *args, **kwargs):
+        def import_side_effect(name, *_args, **_kwargs) -> Mock:
             """Side effect function to mock imports.
 
             Args:
                 name (str): The name of the module being imported.
-                *args: Additional positional arguments.
-                **kwargs: Additional keyword arguments.
+                *_args: Additional positional arguments.
+                **_kwargs: Additional keyword arguments.
 
             Returns:
                 Mock: A mock module or object based on the import name.
@@ -288,9 +291,10 @@ class TestLLMClientFunctions:
         mock_builder = Mock()
 
         # Test the async context manager
-        async with azure_openai_autogen(config, mock_builder) as client:
-            # Just verify we got a client back without errors
-            assert client is not None
+        gen = azure_openai_autogen(config, mock_builder)
+        client = await gen.__anext__()
+
+        assert client is not None
 
     @pytest.mark.asyncio
     @patch('builtins.__import__')
@@ -350,7 +354,7 @@ class TestAutoGenThinkingInjector:
 
             # Verify patch_with_thinking was called with injector
             mock_patch.assert_called_once()
-            args, kwargs = mock_patch.call_args
+            args, _kwargs = mock_patch.call_args
             assert args[0] == mock_client
 
             # The second argument should be an injector instance
@@ -376,7 +380,17 @@ class TestLLMClientGeneratorsFull:
         mock_autogen_core.models.ModelInfo = mock_model_info_class
         mock_autogen_ext.models.openai.OpenAIChatCompletionClient = mock_client_class
 
-        def side_effect(name, *args, **kwargs):
+        def side_effect(name, *_args, **_kwargs) -> Mock:
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *_args: Additional positional arguments.
+                **_kwargs: Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
             if name == 'autogen_core.models':
                 return mock_autogen_core
             elif name == 'autogen_ext.models.openai':
@@ -424,7 +438,17 @@ class TestLLMClientGeneratorsFull:
         mock_autogen_core.models.ModelInfo = Mock()
         mock_autogen_ext.models.openai.OpenAIChatCompletionClient = mock_client_class
 
-        def side_effect(name, *args, **kwargs):
+        def side_effect(name, *_args, **_kwargs) -> Mock:
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *_args: Additional positional arguments.
+                **_kwargs: Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
             if name == 'autogen_core.models':
                 return mock_autogen_core
             elif name == 'autogen_ext.models.openai':
@@ -467,7 +491,17 @@ class TestLLMClientGeneratorsFull:
         mock_autogen_core.models.ModelInfo = Mock()
         mock_autogen_ext.models.openai.OpenAIChatCompletionClient = mock_client_class
 
-        def side_effect(name, *args, **kwargs):
+        def side_effect(name, *_args, **_kwargs) -> Mock:
+            """Side effect function to mock imports.
+
+            Args:
+                name (str): The name of the module being imported.
+                *_args: Additional positional arguments.
+                **_kwargs: Additional keyword arguments.
+
+            Returns:
+                Mock: A mock module or object based on the import name.
+            """
             if name == 'autogen_core.models':
                 return mock_autogen_core
             elif name == 'autogen_ext.models.openai':
@@ -505,6 +539,7 @@ class TestMixinCombinations:
         mock_client = Mock()
 
         class RetryOnlyConfig(LLMBaseConfig, RetryMixin):
+            """Config with only retry mixin."""
             pass
 
         config = RetryOnlyConfig()

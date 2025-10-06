@@ -80,7 +80,6 @@ Workflow Result:
 ['Today in New York:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
 --------------------------------------------------
 
-(.venv)
 ```
 
 ## Architecture
