@@ -70,16 +70,42 @@ nat run --config_file examples/frameworks/nat_autogen_demo/configs/config.yml --
 
 ```console
 [12:44] BASH_$
+2025-10-07 14:34:28,122 - nat.cli.commands.start - INFO - Starting NAT from config file: 'examples/frameworks/nat_autogen_demo/configs/config.yml'
+2025-10-07 14:34:30,285 - mcp.client.streamable_http - INFO - Received session ID: 652a05b6646c4ddb945cf2adf0b3ec18
+Received session ID: 652a05b6646c4ddb945cf2adf0b3ec18
+2025-10-07 14:34:30,287 - mcp.client.streamable_http - INFO - Negotiated protocol version: 2025-06-18
+Negotiated protocol version: 2025-06-18
 
-2025.09.19_12:44:06 || INFO     || nat.front_ends.console.console_front_end_plugin:96 ::
+Configuration Summary:
+--------------------
+Workflow Type: autogen_team
+Number of Functions: 1
+Number of Function Groups: 0
+Number of LLMs: 1
+Number of Embedders: 0
+Number of Memory: 0
+Number of Object Stores: 0
+Number of Retrievers: 0
+Number of TTC Strategies: 0
+Number of Authentication Providers: 0
+
+2025-10-07 14:34:30,301 - nat.observability.exporter_manager - INFO - Started exporter 'otelcollector'
+2025-10-07 14:34:46,704 - nat.front_ends.console.console_front_end_plugin - INFO -
+.
+.
+.
+<snipped for brevity>
+.
+.
+.
 --------------------------------------------------
 Workflow Result:
-['Today in New York:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
+['New York weather: Sunny, around 25°C (77°F).\nCurrent local time in New York: 5:34 PM EDT (UTC−4) on October 7, 2025.\n\nAPPROVE']
 --------------------------------------------------
 
 --------------------------------------------------
 Workflow Result:
-['Today in New York:\n- The weather is partly cloudy with a temperature of 22°C (72°F).\n- The current time is 8:44 PM (JST).']
+['New York weather: Sunny, around 25°C (77°F).\nCurrent local time in New York: 5:34 PM EDT (UTC−4) on October 7, 2025.\n\nAPPROVE']
 --------------------------------------------------
 
 ```
