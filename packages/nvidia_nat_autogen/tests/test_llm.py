@@ -30,25 +30,22 @@ from nat.llm.openai_llm import OpenAIModelConfig
 from nat.plugins.autogen.llm import _patch_autogen_client_based_on_config
 
 
-class TestRetryConfig(LLMBaseConfig, RetryMixin):
-    """Test config with retry mixin."""
-    __test__ = False  # Tell pytest this isn't a test class
+class MockRetryConfig(LLMBaseConfig, RetryMixin):
+    """Mock config with retry mixin."""
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
     retry_on_errors: list[Any] | None = ["timeout"]
 
 
-class TestThinkingConfig(LLMBaseConfig, ThinkingMixin):
-    """Test config with thinking mixin."""
-    __test__ = False  # Tell pytest this isn't a test class
+class MockThinkingConfig(LLMBaseConfig, ThinkingMixin):
+    """Mock config with thinking mixin."""
 
     thinking_system_prompt: str = "Think step by step"
 
 
-class TestCombinedConfig(LLMBaseConfig, RetryMixin, ThinkingMixin):
-    """Test config with both mixins."""
-    __test__ = False  # Tell pytest this isn't a test class
+class MockCombinedConfig(LLMBaseConfig, RetryMixin, ThinkingMixin):
+    """Mock config with both mixins."""
 
     num_retries: int = 3
     retry_on_status_codes: list = [500, 502, 503]
@@ -74,7 +71,7 @@ class TestPatchAutoGenClient:
         mock_patched_client = Mock()
         mock_patch_retry.return_value = mock_patched_client
 
-        retry_config = TestRetryConfig()
+        retry_config = MockRetryConfig()
         retry_config.num_retries = 5
         retry_config.retry_on_status_codes = [500, 503]
         retry_config.retry_on_errors = ["timeout", "connection"]
@@ -95,7 +92,7 @@ class TestPatchAutoGenClient:
         mock_patch_thinking.return_value = mock_patched_client
 
         # Create a mock thinking config that has a non-None thinking_system_prompt
-        thinking_config = Mock(spec=TestThinkingConfig)
+        thinking_config = Mock(spec=MockThinkingConfig)
         thinking_config.thinking_system_prompt = "Think step by step"
 
         result = _patch_autogen_client_based_on_config(mock_client, thinking_config)
@@ -115,7 +112,7 @@ class TestPatchAutoGenClient:
         mock_patch_retry.return_value = mock_retry_client
         mock_patch_thinking.return_value = mock_final_client
 
-        class CombinedConfig(TestRetryConfig, TestThinkingConfig):
+        class CombinedConfig(MockRetryConfig, MockThinkingConfig):
             """Combined config for testing."""
             pass
 
@@ -192,7 +189,7 @@ class TestThinkingInjector:
         """Test that thinking injector can be created."""
         # Test the integration pattern for thinking injection
         mock_client = Mock()
-        thinking_config = Mock(spec=TestThinkingConfig)
+        thinking_config = Mock(spec=MockThinkingConfig)
         thinking_config.thinking_system_prompt = "Think carefully"
 
         with patch('nat.plugins.autogen.llm.patch_with_thinking') as mock_patch:
@@ -346,7 +343,7 @@ class TestAutoGenThinkingInjector:
         # Since AutoGenThinkingInjector is defined inside the function,
         # we test through the integration pattern
         mock_client = Mock()
-        thinking_config = Mock(spec=TestThinkingConfig)
+        thinking_config = Mock(spec=MockThinkingConfig)
         thinking_config.thinking_system_prompt = "Think carefully"
 
         with patch('nat.plugins.autogen.llm.patch_with_thinking') as mock_patch:

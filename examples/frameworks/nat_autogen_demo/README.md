@@ -37,11 +37,13 @@ If you have not already done so, follow the instructions in the [Install Guide](
 From the root directory of the NAT library, run the following commands:
 
 ```bash
-uv pip install -e '.[autogen]'
+uv pip install -e examples/getting_started/simple_calculator  # required to run the current_datetime MCP tool used in example workflow.
 uv pip install -e examples/frameworks/nat_autogen_demo
 ```
 
-### Set up API keys
+### Export required ENV variables
+If you have not already done so, follow the [Obtaining API Keys](../../../docs/source/quick-start/installing.md#obtaining-api-keys) instructions to obtain API keys.
+
 For OpenAI Export these:
 - OPENAI_MODEL_NAME
 - OPENAI_API_KEY

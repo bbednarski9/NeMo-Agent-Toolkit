@@ -30,10 +30,8 @@ from nat.plugins.autogen.tool_wrapper import autogen_tool_wrapper
 from nat.plugins.autogen.tool_wrapper import resolve_type
 
 
-class TestInputSchema(BaseModel):
-    """Test input schema for tool wrapper."""
-
-    __test__ = False  # Tell pytest this isn't a test class
+class MockInputSchema(BaseModel):
+    """Mock input schema for tool wrapper."""
 
     param1: str
     param2: int
@@ -41,10 +39,8 @@ class TestInputSchema(BaseModel):
 
 
 @dataclass
-class TestDataclassSchema:
-    """Test dataclass schema for tool wrapper."""
-
-    __test__ = False  # Tell pytest this isn't a test class
+class MockDataclassSchema:
+    """Mock dataclass schema for tool wrapper."""
 
     param1: str
     param2: int
@@ -96,7 +92,7 @@ class TestAutoGenToolWrapper:
         """Create a mock NAT function."""
         mock_fn = Mock(spec=Function)
         mock_fn.description = "Test function description"
-        mock_fn.input_schema = TestInputSchema
+        mock_fn.input_schema = MockInputSchema
         mock_fn.has_streaming_output = False
         mock_fn.has_single_output = True
         mock_fn.acall_invoke = AsyncMock(return_value="test_result")
@@ -197,7 +193,7 @@ class TestNatFunctionDecorator:
         # Mock the decorator pattern from the source
         name = "test_name"
         description = "test_description"
-        input_schema = TestInputSchema
+        input_schema = MockInputSchema
 
         # Set metadata like the decorator does
         test_func.__name__ = name
@@ -225,7 +221,7 @@ class TestNatFunctionDecorator:
 
     def test_signature_creation_with_schema(self):
         """Test signature creation with input schema."""
-        input_schema = TestInputSchema
+        input_schema = MockInputSchema
         annotations = getattr(input_schema, "__annotations__", {}) or {}
 
         params = []

@@ -27,6 +27,7 @@ from typing import get_origin
 
 from autogen_core.tools import FunctionTool
 from pydantic import BaseModel
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from nat.builder.builder import Builder
 from nat.builder.framework_enum import LLMFrameworkEnum
@@ -121,7 +122,7 @@ def autogen_tool_wrapper(
 
         # If input_schema is a dataclass, convert it to a Pydantic model
         if input_schema is not None and is_dataclass(input_schema):
-            input_schema = BaseModel.model_validate(input_schema)
+            input_schema = pydantic_dataclass(input_schema)
 
         def decorator(func_to_wrap: Callable[..., Any]) -> Callable[..., Any]:
             """

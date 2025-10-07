@@ -299,7 +299,8 @@ class AutoGenProfilerHandler(BaseProfilerCallback):
                 output = await original_func(*args, **kwargs)
             except Exception as _e:
                 output = f"Tool execution failed with error: {str(_e)}"
-                logger.exception("Error during tool execution")
+                logger.error("Error during tool execution")
+                raise
 
             tool_output = output
 

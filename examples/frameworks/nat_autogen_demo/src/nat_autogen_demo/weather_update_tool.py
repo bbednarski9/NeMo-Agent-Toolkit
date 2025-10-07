@@ -49,7 +49,7 @@ async def weather_update(_config: WeatherToolConfig, _builder: Builder) -> Async
         Returns:
             str: The current weather for the specified city.
         """
-        if city.lower() == "new york":
+        if "new york" in city.lower():
             return "The weather in New York is sunny with a temperature of 25 degrees Celsius (77 degrees Fahrenheit)."
         return f"Weather information for '{city}' is not available."
 

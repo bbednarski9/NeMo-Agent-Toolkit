@@ -43,9 +43,7 @@ class TestRegisterModule:
         from nat.plugins.autogen import llm  # pylint: disable=import-outside-toplevel
 
         # Check for expected functions
-        expected_functions = [
-            '_patch_autogen_client_based_on_config', 'openai_autogen', 'azure_openai_autogen', 'nim_autogen'
-        ]
+        expected_functions = ['openai_autogen', 'azure_openai_autogen', 'nim_autogen']
 
         for func_name in expected_functions:
             assert hasattr(llm, func_name), f"Function {func_name} not found in llm module"
