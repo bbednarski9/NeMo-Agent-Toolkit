@@ -27,7 +27,6 @@ llms:
 
 workflow:
   _type: react_agent
-  use_openai_api: true
   tool_names:
     - calculator
   llm_name: nim_llm
