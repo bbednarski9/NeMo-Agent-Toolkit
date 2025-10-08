@@ -14,17 +14,12 @@
 # limitations under the License.
 
 
+function_groups:
+  calculator:
+    _type: calculator
 functions:
-  calculator_multiply:
-    _type: calculator_multiply
-  calculator_inequality:
-    _type: calculator_inequality
-  calculator_divide:
-    _type: calculator_divide
   current_datetime:
     _type: current_datetime
-  calculator_subtract:
-    _type: calculator_subtract
 llms:
   nim_llm:
     _type: nim
@@ -40,11 +35,8 @@ llms:
 workflow:
   _type: react_agent
   tool_names:
-    - calculator_multiply
-    - calculator_inequality
+    - calculator
     - current_datetime
-    - calculator_divide
-    - calculator_subtract
   llm_name: nim_llm
   verbose: true
   retry_agent_response_parsing_errors: true

@@ -52,10 +52,10 @@ You can specify a filter to only publish a subset of tools from the workflow.
 
 ```bash
 nat mcp serve --config_file examples/getting_started/simple_calculator/configs/config.yml \
-  --tool_names calculator_multiply \
-  --tool_names calculator_divide \
-  --tool_names calculator_subtract \
-  --tool_names calculator_inequality
+  --tool_names calculator.multiply \
+  --tool_names calculator.compare \
+  --tool_names calculator.subtract \
+  --tool_names calculator.divide
 ```
 
 ## Displaying MCP Tools published by an MCP server
@@ -70,10 +70,10 @@ nat mcp client tool list
 
 Sample output:
 ```
-calculator_multiply
-calculator_inequality
-calculator_divide
-calculator_subtract
+calculator.multiply
+calculator.compare
+calculator.divide
+calculator.subtract
 ```
 
 ### Debug route for listing tools (no MCP client required)
@@ -89,13 +89,13 @@ You can request one or more specific tools by name. The `name` parameter accepts
 
 ```bash
 # Single tool (detailed by default)
-curl -s "http://localhost:9901/debug/tools/list?name=calculator_multiply" | jq
+curl -s "http://localhost:9901/debug/tools/list?name=calculator.multiply" | jq
 
 # Multiple tools (detailed by default)
-curl -s "http://localhost:9901/debug/tools/list?name=calculator_multiply&name=calculator_divide" | jq
+curl -s "http://localhost:9901/debug/tools/list?name=calculator.multiply&name=calculator.divide" | jq
 
 # Comma-separated list (equivalent)
-curl -s "http://localhost:9901/debug/tools/list?name=calculator_multiply,calculator_divide" | jq
+curl -s "http://localhost:9901/debug/tools/list?name=calculator.multiply,calculator.divide" | jq
 ```
 
 The response includes the tool's name, description, and its input schema by default. For tools that accept a chat‑style input, the schema is simplified as a single `query` string parameter to match the exposed MCP interface.
@@ -105,7 +105,7 @@ You can control the amount of detail using the `detail` query parameter:
 - When requesting specific tool(s) with `name`, detailed schema is returned by default. Pass `detail=false` to suppress schemas:
 
 ```bash
-curl -s "http://localhost:9901/debug/tools/list?name=calculator_multiply&detail=false" | jq
+curl -s "http://localhost:9901/debug/tools/list?name=calculator.multiply&detail=false" | jq
 ```
 
 - When listing all tools (without `name`), the default output is simplified. Pass `detail=true` to include schemas for each tool:
@@ -117,12 +117,12 @@ curl -s "http://localhost:9901/debug/tools/list?detail=true" | jq
 To get more information about a specific tool, use the `--detail` flag or the `--tool` flag followed by the tool name.
 
 ```bash
-nat mcp client tool list --tool calculator_multiply
+nat mcp client tool list --tool calculator.multiply
 ```
 
 Sample output:
 ```
-Tool: calculator_multiply
+Tool: calculator.multiply
 Description: This is a mathematical tool used to multiply two numbers together. It takes 2 numbers as an input and computes their numeric product as the output.
 Input Schema:
 {
@@ -136,7 +136,7 @@ Input Schema:
   "required": [
     "text"
   ],
-  "title": "CalculatorMultiplyInputSchema",
+  "title": "Calculator.MultiplyInputSchema",
   "type": "object"
 }
 ------------------------------------------------------------

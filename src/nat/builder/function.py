@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import logging
-import re
 import typing
 from abc import ABC
 from abc import abstractmethod
@@ -411,13 +410,10 @@ class FunctionGroup:
         ------
         ValueError
             When the function name is empty or blank.
-            When the function name contains invalid characters.
             When the function already exists in the function group.
         """
         if not name.strip():
             raise ValueError("Function name cannot be empty or blank")
-        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
-            raise ValueError(f"Function name can only contain letters, numbers, underscores, and hyphens: {name}")
         if name in self._functions:
             raise ValueError(f"Function {name} already exists in function group {self._instance_name}")
 

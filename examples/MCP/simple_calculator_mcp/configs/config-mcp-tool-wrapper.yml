@@ -24,19 +24,19 @@ functions:
     _type: mcp_tool_wrapper
     url: "http://localhost:9901/mcp"
     transport: "streamable-http"
-    mcp_tool_name: calculator_multiply
+    mcp_tool_name: calculator.multiply
     description: "Returns the product of two numbers"
   calculator_inequality:
     _type: mcp_tool_wrapper
     url: "http://localhost:9901/mcp"
     transport: "streamable-http"
-    mcp_tool_name: calculator_inequality
+    mcp_tool_name: calculator.compare
     description: "Returns the inequality of two numbers"
   calculator_divide:
     _type: mcp_tool_wrapper
     url: "http://localhost:9901/mcp"
     transport: "streamable-http"
-    mcp_tool_name: calculator_divide
+    mcp_tool_name: calculator.divide
     description: "Returns the quotient of two numbers"
   current_datetime:
     _type: current_datetime
@@ -44,7 +44,7 @@ functions:
     _type: mcp_tool_wrapper
     url: "http://localhost:9901/mcp"
     transport: "streamable-http"
-    mcp_tool_name: calculator_subtract
+    mcp_tool_name: calculator.subtract
     description: "Returns the difference of two numbers"
 
 llms:
@@ -53,10 +53,6 @@ llms:
     model_name: meta/llama-3.1-70b-instruct
     temperature: 0.0
     max_tokens: 1024
-  openai_llm:
-    _type: openai
-    model_name: gpt-3.5-turbo
-    max_tokens: 2000
 
 workflow:
   _type: react_agent

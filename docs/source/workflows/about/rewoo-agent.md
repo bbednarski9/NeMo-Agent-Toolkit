@@ -55,19 +55,14 @@ workflow:
 
 In your YAML file, to use the ReWOO agent as a function:
 ```yaml
+function_groups:
+  calculator:
+    _type: calculator
 functions:
-  calculator_multiply:
-    _type: calculator_multiply
-  calculator_inequality:
-    _type: calculator_inequality
-  calculator_divide:
-    _type: nat_simple_calculator/calculator_divide
   math_agent:
     _type: rewoo_agent
     tool_names:
-      - calculator_multiply
-      - calculator_inequality
-      - calculator_divide
+      - calculator
     description: 'Useful for performing simple mathematical calculations.'
 ```
 
@@ -75,7 +70,7 @@ functions:
 
 * `workflow_alias`: Defaults to `None`. The alias of the workflow. Useful when the ReWOO agent is configured as a workflow and need to expose a customized name as a tool.
 
-* `tool_names`: A list of tools that the agent can call. The tools must be functions configured in the YAML file
+* `tool_names`: A list of tools that the agent can call. The tools must be functions or function groups configured in the YAML file
 
 * `llm_name`: The LLM the agent should use. The LLM must be configured in the YAML file
 

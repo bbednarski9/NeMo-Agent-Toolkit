@@ -127,10 +127,10 @@ function_groups:
     max_sessions: 50  # Maximum concurrent sessions
     session_idle_timeout: 7200  # 2 hours (in seconds)
     tool_overrides:
-      calculator_add:
+      "calculator.add":
         alias: "add_numbers"
         description: "Add two numbers together"
-      calculator_multiply:
+      "calculator.multiply":
         description: "Multiply two numbers"  # Keeps original name
 ```
 
@@ -273,11 +273,11 @@ For SSE transport, ensure the MCP server is started with the `--transport sse` f
 
 Sample output:
 ```text
-calculator_multiply
-calculator_inequality
+calculator.multiply
+calculator.compare
 current_datetime
-calculator_divide
-calculator_subtract
+calculator.divide
+calculator.subtract
 react_agent
 ```
 
@@ -286,7 +286,7 @@ react_agent
 To get detailed information about a specific tool, use the `--tool` flag:
 
 ```bash
-nat mcp client tool list --url http://localhost:9901/mcp --tool calculator_multiply
+nat mcp client tool list --url http://localhost:9901/mcp --tool calculator.multiply
 ```
 
 ### Call a Tool
@@ -295,7 +295,7 @@ To call a tool and see its output:
 
 ```bash
 # Pass arguments as JSON
-nat mcp client tool call calculator_multiply \
+nat mcp client tool call calculator.multiply \
   --url http://localhost:9901/mcp \
   --json-args '{"text": "2 * 3"}'
 ```
@@ -310,7 +310,7 @@ This will use the `mcp_oauth2` authentication provider to authenticate the user.
 
 Sample output:
 ```text
-Tool: calculator_multiply
+Tool: calculator.multiply
 Description: This is a mathematical tool used to multiply two numbers together. It takes 2 numbers as an input and computes their numeric product as the output.
 Input Schema:
 {
@@ -392,25 +392,25 @@ When you serve a workflow that includes an `mcp_client` function group, the NeMo
       "session_healthy": true,
       "tools": [
         {
-          "name": "calculator_divide",
+          "name": "calculator.divide",
           "description": "This is a mathematical tool used to divide one number by another. It takes 2 numbers as an input and computes their numeric quotient as the output.",
           "server": "streamable-http:http://localhost:9901/mcp",
           "available": true
         },
         {
-          "name": "calculator_inequality",
+          "name": "calculator.compare",
           "description": "This is a mathematical tool used to perform an inequality comparison between two numbers. It takes two numbers as an input and determines if one is greater or are equal.",
           "server": "streamable-http:http://localhost:9901/mcp",
           "available": true
         },
         {
-          "name": "calculator_multiply",
+          "name": "calculator.multiply",
           "description": "This is a mathematical tool used to multiply two numbers together. It takes 2 numbers as an input and computes their numeric product as the output.",
           "server": "streamable-http:http://localhost:9901/mcp",
           "available": true
         },
         {
-          "name": "calculator_subtract",
+          "name": "calculator.subtract",
           "description": "This is a mathematical tool used to subtract one number from another. It takes 2 numbers as an input and computes their numeric difference as the output.",
           "server": "streamable-http:http://localhost:9901/mcp",
           "available": true
