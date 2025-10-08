@@ -36,7 +36,7 @@ This example demonstrates an end-to-end (E2E) agentic workflow using the NeMo Ag
 
 ## Key Features
 
-- **Custom Calculator Tools:** Demonstrates five mathematical tools as functions and function groups - `calculator.add`, `calculator.multiply`, `calculator.compare`, `calculator.divide`, `calculator.subtract`, and `current_datetime` for mathematical operations and time-based comparisons.
+- **Custom Calculator Tools:** Demonstrates five mathematical tools as function groups - `calculator.add`, `calculator.multiply`, `calculator.compare`, `calculator.divide`, and `calculator.subtract`. Also includes a `current_datetime` function for time-based comparisons.
 - **ReAct Agent Integration:** Uses a `react_agent` that performs reasoning between tool calls to solve complex mathematical queries requiring multiple steps.
 - **Multi-step Problem Solving:** Shows how an agent can break down complex questions like "Is the product of 2 * 4 greater than the current hour?" into sequential tool calls.
 - **Custom Function Registration:** Demonstrates the NeMo Agent toolkit plugin system for registering custom mathematical functions with proper validation and error handling.
@@ -61,7 +61,6 @@ If you have not already done so, follow the [Obtaining API Keys](../../../docs/s
 
 ```bash
 export NVIDIA_API_KEY=<YOUR_API_KEY>
-export OPENAI_API_KEY=<YOUR_API_KEY>  # OPTIONAL
 ```
 
 ### Run the Workflow

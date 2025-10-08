@@ -33,6 +33,10 @@ function_groups:
   calculator:
     _type: calculator
 
+functions:
+  current_datetime:
+    _type: current_datetime
+
 llms:
   nim_llm:
     _type: nim
