@@ -26,7 +26,6 @@ from typing import get_args
 from typing import get_origin
 
 from autogen_core.tools import FunctionTool
-from pydantic import BaseModel
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from nat.builder.builder import Builder
