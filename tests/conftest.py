@@ -37,6 +37,7 @@ from unittest import mock
 
 import pytest
 import pytest_asyncio
+from dotenv import load_dotenv
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.callbacks import AsyncCallbackManagerForToolRun
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -49,6 +50,8 @@ from langchain_core.outputs import ChatResult
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
 from pydantic.warnings import PydanticDeprecatedSince20
+
+load_dotenv()
 
 TESTS_DIR = os.path.dirname(__file__)
 PROJECT_DIR = os.path.dirname(TESTS_DIR)

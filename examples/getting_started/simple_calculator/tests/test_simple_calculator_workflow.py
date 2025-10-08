@@ -20,9 +20,7 @@ import pytest
 
 from nat.runtime.loader import load_workflow
 from nat.test.utils import locate_example_config
-from nat_simple_calculator.register import DivisionToolConfig
-from nat_simple_calculator.register import InequalityToolConfig
-from nat_simple_calculator.register import MultiplyToolConfig
+from nat_simple_calculator.register import CalculatorToolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +29,7 @@ logger = logging.getLogger(__name__)
 @pytest.mark.usefixtures("nvidia_api_key")
 async def test_inequality_tool_workflow():
 
-    config_file: Path = locate_example_config(InequalityToolConfig)
+    config_file: Path = locate_example_config(CalculatorToolConfig)
 
     async with load_workflow(config_file) as workflow:
 
@@ -47,7 +45,7 @@ async def test_inequality_tool_workflow():
 @pytest.mark.usefixtures("nvidia_api_key")
 async def test_multiply_tool_workflow():
 
-    config_file: Path = locate_example_config(MultiplyToolConfig)
+    config_file: Path = locate_example_config(CalculatorToolConfig)
 
     async with load_workflow(config_file) as workflow:
 
@@ -63,7 +61,7 @@ async def test_multiply_tool_workflow():
 @pytest.mark.usefixtures("nvidia_api_key")
 async def test_division_tool_workflow():
 
-    config_file: Path = locate_example_config(DivisionToolConfig)
+    config_file: Path = locate_example_config(CalculatorToolConfig)
 
     async with load_workflow(config_file) as workflow:
 
