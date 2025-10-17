@@ -33,7 +33,18 @@ class NumericOptimizationConfig(BaseModel):
     Configuration for numeric/enum optimization (Optuna).
     """
     enabled: bool = Field(default=True, description="Enable numeric optimization")
-    n_trials: int = Field(description="Number of trials for numeric optimization.", default=20)
+    
+    sampler: str = Field(
+        default="bayesian",
+        description="Sampler type: 'bayesian' (TPE sampler for Bayesian optimization) or "
+                   "'grid' (exhaustive grid search over all parameter combinations). "
+                   "Grid search ignores n_trials and automatically tests all combinations."
+    )
+    
+    n_trials: int = Field(
+        description="Number of trials for Bayesian optimization. Ignored when sampler='grid'.",
+        default=20
+    )
 
 
 class PromptGAOptimizationConfig(BaseModel):

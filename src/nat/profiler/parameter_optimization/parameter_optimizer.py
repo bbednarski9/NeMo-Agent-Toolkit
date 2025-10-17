@@ -16,8 +16,11 @@
 import asyncio
 import logging
 from collections.abc import Mapping as Dict
+from functools import reduce
+from operator import mul
 
 import optuna
+from optuna.samplers import GridSampler
 import yaml
 
 from nat.data_models.config import Config
@@ -31,6 +34,41 @@ from nat.profiler.parameter_optimization.parameter_selection import pick_trial
 from nat.profiler.parameter_optimization.update_helpers import apply_suggestions
 
 logger = logging.getLogger(__name__)
+
+
+def _build_grid_search_space(space: Dict[str, SearchSpace]) -> dict[str, list]:
+    """
+    Build Optuna GridSampler search space from SearchSpace objects.
+    Only supports categorical parameters (values-based).
+    
+    Args:
+        space: Dictionary mapping parameter names to SearchSpace objects
+        
+    Returns:
+        Dictionary mapping parameter names to lists of values for grid search
+        
+    Raises:
+        ValueError: If any parameter has numeric ranges instead of explicit values
+    """
+    grid_space = {}
+    for param_name, search_space in space.items():
+        if search_space.values is not None:
+            # Categorical parameter - perfect for grid search
+            grid_space[param_name] = list(search_space.values)
+        elif search_space.low is not None and search_space.high is not None:
+            # Numeric range - grid search needs discrete values
+            logger.warning(
+                "Parameter '%s' has numeric range [%s, %s]. Grid search requires "
+                "explicit values. Consider using categorical values or bayesian sampler.",
+                param_name, search_space.low, search_space.high
+            )
+            raise ValueError(
+                f"Grid search requires explicit 'values' for parameter '{param_name}'. "
+                f"Use sampler='bayesian' for numeric ranges or provide explicit values."
+            )
+        else:
+            raise ValueError(f"Parameter '{param_name}' has invalid search space configuration.")
+    return grid_space
 
 
 @experimental(feature_name="Optimizer")
@@ -59,7 +97,34 @@ def optimize_parameters(
     eval_metrics = [v.evaluator_name for v in metric_cfg.values()]
     weights = [v.weight for v in metric_cfg.values()]
 
-    study = optuna.create_study(directions=directions)
+    # Determine sampler type and create study
+    sampler_type = optimizer_config.numeric.sampler.lower()
+    
+    if sampler_type == "grid":
+        # Build grid search space and create GridSampler
+        grid_space = _build_grid_search_space(space)
+        
+        # Calculate total number of combinations
+        n_combinations = reduce(mul, (len(values) for values in grid_space.values()), 1)
+        logger.info(
+            "Grid search enabled: %d unique parameter combinations to evaluate",
+            n_combinations
+        )
+        
+        sampler = GridSampler(search_space=grid_space)
+        study = optuna.create_study(directions=directions, sampler=sampler)
+        n_trials = n_combinations  # Override n_trials for grid search
+        
+    elif sampler_type == "bayesian":
+        # Use default TPE sampler (Bayesian optimization)
+        study = optuna.create_study(directions=directions)
+        n_trials = optimizer_config.numeric.n_trials
+        logger.info("Bayesian optimization enabled: %d trials", n_trials)
+        
+    else:
+        raise ValueError(
+            f"Invalid sampler type '{sampler_type}'. Must be 'bayesian' (default) or 'grid'."
+        )
 
     # Create output directory for intermediate files
     out_dir = optimizer_config.output_path
@@ -97,7 +162,8 @@ def optimize_parameters(
             return await asyncio.gather(*tasks)
 
         with (out_dir / f"config_numeric_trial_{trial._trial_id}.yml").open("w") as fh:
-            yaml.dump(cfg_trial.model_dump(), fh)
+            trial_config_dict = cfg_trial.model_dump(mode='json', exclude_none=False)
+            yaml.dump(trial_config_dict, fh, default_flow_style=False, sort_keys=False)
 
         all_scores = asyncio.run(_run_all_evals())
         # Persist raw per‑repetition scores so they appear in `trials_dataframe`.
@@ -105,7 +171,7 @@ def optimize_parameters(
         return [sum(run[i] for run in all_scores) / reps for i in range(len(eval_metrics))]
 
     logger.info("Starting numeric / enum parameter optimization...")
-    study.optimize(_objective, n_trials=optimizer_config.numeric.n_trials)
+    study.optimize(_objective, n_trials=n_trials)
     logger.info("Numeric optimization finished")
 
     best_params = pick_trial(
@@ -116,8 +182,10 @@ def optimize_parameters(
     tuned_cfg = apply_suggestions(base_cfg, best_params)
 
     # Save final results (out_dir already created and defined above)
+    # Use model_dump with mode='json' to get serializable output without Python-specific tags
     with (out_dir / "optimized_config.yml").open("w") as fh:
-        yaml.dump(tuned_cfg.model_dump(), fh)
+        config_dict = tuned_cfg.model_dump(mode='json', exclude_none=False)
+        yaml.dump(config_dict, fh, default_flow_style=False, sort_keys=False)
     with (out_dir / "trials_dataframe_params.csv").open("w") as fh:
         # Export full trials DataFrame (values, params, timings, etc.).
         df = study.trials_dataframe()
