@@ -15,6 +15,7 @@
 
 import abc
 import datetime
+import secrets
 import typing
 import uuid
 from abc import abstractmethod
@@ -74,6 +75,8 @@ class ChatContentType(str, Enum):
     TEXT = "text"
     IMAGE_URL = "image_url"
     INPUT_AUDIO = "input_audio"
+    # Azure AI Foundry / Responses API use "input_text" for user text content
+    INPUT_TEXT = "input_text"
 
 
 class InputAudio(BaseModel):
@@ -107,6 +110,16 @@ class TextContent(BaseModel):
     text: str = "default"
 
 
+class InputTextContent(BaseModel):
+    """
+    Same as TextContent but with type "input_text" for Azure AI Foundry / Responses API compatibility.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    type: typing.Literal[ChatContentType.INPUT_TEXT] = ChatContentType.INPUT_TEXT
+    text: str = "default"
+
+
 class Security(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -114,12 +127,24 @@ class Security(BaseModel):
     token: SerializableSecretStr = Field(default="default")
 
 
-UserContent = typing.Annotated[TextContent | ImageContent | AudioContent, Discriminator("type")]
+UserContent = typing.Annotated[
+    TextContent | InputTextContent | ImageContent | AudioContent, Discriminator("type")
+]
 
 
 class Message(BaseModel):
     content: str | list[UserContent]
     role: UserMessageContentRoleType
+
+    @field_serializer("content")
+    def _serialize_content_for_openai(self, value: str | list[UserContent]) -> str | list[UserContent]:
+        """Serialize content so OpenAI-compatible APIs receive type 'text' instead of 'input_text'."""
+        if isinstance(value, str):
+            return value
+        return [
+            TextContent(text=item.text) if isinstance(item, InputTextContent) else item
+            for item in value
+        ]
 
 
 class ChatRequest(BaseModel):
@@ -901,8 +926,8 @@ class ResponsesRequest(BaseModel):
                                   }
                               })
 
-    # Required field
-    model: str = Field(description="ID of the model to use")
+    # Optional model field
+    model: str | None = Field(default=None, description="ID of the model to use")
 
     # Input can be a string or list of input items
     input: str | list[dict[str, typing.Any]] = Field(
@@ -1035,7 +1060,7 @@ class ResponsesOutputItem(BaseModel):
     """Output item in Responses API format."""
 
     type: typing.Literal["message"] = "message"
-    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
+    id: str = Field(default_factory=lambda: f"msg_{secrets.token_hex(30)}"[:64])
     status: typing.Literal["in_progress", "completed", "incomplete"] = "completed"
     role: typing.Literal["assistant"] = "assistant"
     content: list[ResponsesOutputContent] = Field(default_factory=list)
@@ -1055,7 +1080,7 @@ class ResponsesAPIResponse(ResponseBaseModelOutput):
     https://platform.openai.com/docs/api-reference/responses
     """
 
-    id: str = Field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:24]}")
+    id: str = Field(default_factory=lambda: f"rsp_{secrets.token_hex(30)}"[:64])
     object: typing.Literal["response"] = "response"
     created_at: int = Field(
         default_factory=lambda: int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()))
