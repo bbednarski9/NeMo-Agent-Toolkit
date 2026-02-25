@@ -946,6 +946,43 @@ Features:
             std = exp_df['tsq_score'].std()
             print(f"  - {exp}: {count} samples, TSQ median={median:.3f}, std={std:.3f}")
 
+    # Print overall tokens/second summary
+    print("\n=== Tokens/Second Summary ===")
+    total_tokens_all = df['total_tokens'].sum()
+    total_duration_all = df['total_duration_sec'].sum()
+    if total_duration_all > 0:
+        overall_tps = total_tokens_all / total_duration_all
+        print(f"  Total tokens generated: {total_tokens_all:,}")
+        print(f"  Total LLM time: {total_duration_all:,.2f} s")
+        print(f"  Overall tokens/sec (total_tokens / total_LLM_time): {overall_tps:,.2f}")
+    else:
+        print("  No duration data available")
+
+    if 'median_tps' in df.columns:
+        print(f"  Per-request median TPS — mean: {df['median_tps'].mean():,.2f}, "
+              f"median: {df['median_tps'].median():,.2f}, "
+              f"std: {df['median_tps'].std():,.2f}")
+
+    if not llm_call_df.empty and 'tps' in llm_call_df.columns:
+        print(f"  Per-LLM-call TPS — mean: {llm_call_df['tps'].mean():,.2f}, "
+              f"median: {llm_call_df['tps'].median():,.2f}, "
+              f"std: {llm_call_df['tps'].std():,.2f}")
+
+    if len(experiments) > 1:
+        print("\n  Per-experiment breakdown:")
+        for exp in experiments:
+            exp_df = df[df['experiment'] == exp]
+            exp_tokens = exp_df['total_tokens'].sum()
+            exp_duration = exp_df['total_duration_sec'].sum()
+            if exp_duration > 0:
+                exp_tps = exp_tokens / exp_duration
+                print(f"    {exp}: {exp_tokens:,} tokens / {exp_duration:,.2f}s = {exp_tps:,.2f} tok/s")
+            if not llm_call_df.empty and 'tps' in llm_call_df.columns:
+                exp_llm = llm_call_df[llm_call_df['experiment'] == exp]
+                if not exp_llm.empty:
+                    print(f"      Per-LLM-call TPS — mean: {exp_llm['tps'].mean():,.2f}, "
+                          f"median: {exp_llm['tps'].median():,.2f}")
+
     # Report on trial matching if trial_number column exists
     if 'trial_number' in df.columns:
         matched = df['trial_number'].notna().sum()

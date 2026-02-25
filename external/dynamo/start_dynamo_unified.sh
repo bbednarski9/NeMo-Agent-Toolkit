@@ -37,6 +37,25 @@ TP_SIZE="${DYNAMO_TP_SIZE:-2}"
 HTTP_PORT="${DYNAMO_HTTP_PORT:-8000}"
 SERVED_MODEL_NAME=""  # set after validation
 IMAGE="nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.9.0"
+
+# Source-built image override (set DYNAMO_FROM_SOURCE=true and DYNAMO_IMAGE in .env)
+if [ "${DYNAMO_FROM_SOURCE:-false}" = "true" ]; then
+    if [ -z "${DYNAMO_IMAGE:-}" ]; then
+        echo "ERROR: DYNAMO_FROM_SOURCE=true but DYNAMO_IMAGE is not set." >&2
+        echo "  Set DYNAMO_IMAGE in .env (e.g. DYNAMO_IMAGE=dynamo-sglang-source:backpressure)" >&2
+        exit 1
+    fi
+    IMAGE="${DYNAMO_IMAGE}"
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
+        echo "ERROR: Docker image '$IMAGE' not found locally." >&2
+        echo "  Build it first:" >&2
+        echo "    cd /path/to/dynamo" >&2
+        echo "    container/build.sh --framework SGLANG --target runtime --tag $IMAGE" >&2
+        exit 1
+    fi
+    echo "Using source-built image: $IMAGE"
+fi
+
 SHM_SIZE="${DYNAMO_SHM_SIZE:-16g}"
 
 # Infrastructure ports (can be overridden via environment variables)
@@ -356,6 +375,11 @@ docker run -d \
   -e KV_BLOCK_SIZE=$KV_BLOCK_SIZE \
   -e MAX_MODEL_LEN=$MAX_MODEL_LEN \
   -e NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE \
+  -e DYNAMO_ROUTER_TRACK_OUTPUT_BLOCKS="${DYNAMO_ROUTER_TRACK_OUTPUT_BLOCKS:-false}" \
+  -e DYNAMO_ROUTER_QUEUE_THRESHOLD="${DYNAMO_ROUTER_QUEUE_THRESHOLD:-}" \
+  -e DYNAMO_ENABLE_HIERARCHICAL_CACHE="${DYNAMO_ENABLE_HIERARCHICAL_CACHE:-false}" \
+  -e DYNAMO_HICACHE_RATIO="${DYNAMO_HICACHE_RATIO:-}" \
+  -e DYNAMO_HICACHE_POLICY="${DYNAMO_HICACHE_POLICY:-}" \
   $IMAGE \
   bash -c "
     set -e  # Exit on any error
@@ -466,6 +490,15 @@ docker run -d \
         if [ -n \"\$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
             EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --num-gpu-blocks-override \$NUM_GPU_BLOCKS_OVERRIDE\"
         fi
+        if [ \"$DYNAMO_ENABLE_HIERARCHICAL_CACHE\" = \"true\" ]; then
+            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --enable-hierarchical-cache\"
+            if [ -n \"$DYNAMO_HICACHE_RATIO\" ]; then
+                EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --hicache-ratio $DYNAMO_HICACHE_RATIO\"
+            fi
+            if [ -n \"$DYNAMO_HICACHE_POLICY\" ]; then
+                EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --hicache-write-policy $DYNAMO_HICACHE_POLICY\"
+            fi
+        fi
         # DYN_SYSTEM_PORT: unique Prometheus metrics port per worker (required by --enable-metrics;
         # workers share the host network so each needs a distinct port).
         # DYN_NAMESPACE=workers: puts workers in the workers namespace so the Grafana dashboard
@@ -516,6 +549,14 @@ docker run -d \
         # --no-kv-events: router predicts cache state from its own routing decisions
         #   (workers in unified mode don't publish kv-events-config, so events are unavailable)
         KV_FRONTEND_FLAGS=\"--router-mode kv --kv-cache-block-size \$KV_BLOCK_SIZE --no-kv-events\"
+    fi
+    if [ \"$DYNAMO_ROUTER_TRACK_OUTPUT_BLOCKS\" = \"true\" ]; then
+        KV_FRONTEND_FLAGS=\"\$KV_FRONTEND_FLAGS --track-output-blocks\"
+        echo \"Router output block tracking enabled (uses osl hint)\"
+    fi
+    if [ -n \"$DYNAMO_ROUTER_QUEUE_THRESHOLD\" ]; then
+        KV_FRONTEND_FLAGS=\"\$KV_FRONTEND_FLAGS --router-queue-threshold $DYNAMO_ROUTER_QUEUE_THRESHOLD\"
+        echo \"Router queue threshold set to $DYNAMO_ROUTER_QUEUE_THRESHOLD (enables latency_sensitivity)\"
     fi
     python3 -m dynamo.frontend \
       --http-port=$HTTP_PORT \

@@ -15,12 +15,12 @@
 # limitations under the License.
 
 # Dynamo Shutdown Script
-# Stops all components: Dynamo worker container (SGLang or vLLM), ETCD, and NATS
-# Works for: UNIFIED, THOMPSON SAMPLING, and DISAGGREGATED modes
+# Stops all components: Docker containers AND bare-metal processes
+# Works for: UNIFIED, THOMPSON SAMPLING, DISAGGREGATED, and CACHE PINNING modes
 # Supports both SGLang and vLLM backends
 #
 # Usage:
-#   bash stop_dynamo.sh                  # Stop Dynamo, ETCD, NATS only
+#   bash stop_dynamo.sh                  # Stop Dynamo, ETCD, NATS + bare-metal processes
 #   bash stop_dynamo.sh --kill-metrics   # Also stop Prometheus and Grafana
 #   bash stop_dynamo.sh --clear-metrics  # Stop monitoring stack AND remove Prometheus data volume
 
@@ -110,6 +110,87 @@ else
     echo "  (NATS container not running)"
 fi
 
+# ── Bare-metal process cleanup ───────────────────────────────────────────────
+# Kills dynamo processes launched directly on the host (not in containers).
+# Uses PID file from start_dynamo_cache_pinning.sh, then falls back to pgrep.
+BAREMETAL_PIDFILE="/tmp/dynamo-cache-pin/pids"
+KILLED_BAREMETAL=false
+
+kill_process_tree() {
+    local pid=$1
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+    for child in $children; do
+        kill_process_tree "$child"
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+}
+
+echo ""
+echo "========================================================="
+echo "Checking for bare-metal Dynamo processes..."
+echo "========================================================="
+
+# Phase 1: Kill from PID file (most targeted)
+if [ -f "$BAREMETAL_PIDFILE" ]; then
+    echo "  Found PID file: $BAREMETAL_PIDFILE"
+    while IFS= read -r pid; do
+        [ -z "$pid" ] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  Killing process tree rooted at PID $pid..."
+            kill_process_tree "$pid"
+            KILLED_BAREMETAL=true
+        fi
+    done < "$BAREMETAL_PIDFILE"
+    rm -f "$BAREMETAL_PIDFILE"
+fi
+
+# Phase 2: pgrep fallback for any orphaned dynamo processes
+DYNAMO_PATTERNS=(
+    "dynamo\.frontend"
+    "dynamo\.sglang"
+    "dynamo\.vllm"
+)
+
+for pattern in "${DYNAMO_PATTERNS[@]}"; do
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    for pid in $pids; do
+        CMDLINE=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        echo "  Found orphaned process: PID $pid ($CMDLINE)"
+        kill_process_tree "$pid"
+        KILLED_BAREMETAL=true
+    done
+done
+
+if [ "$KILLED_BAREMETAL" = true ]; then
+    sleep 2
+    # SIGKILL any survivors
+    SURVIVORS=false
+    for pattern in "${DYNAMO_PATTERNS[@]}"; do
+        pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+        for pid in $pids; do
+            echo "  Force-killing stubborn process: PID $pid"
+            kill -9 "$pid" 2>/dev/null || true
+            SURVIVORS=true
+        done
+    done
+    if [ -f "$BAREMETAL_PIDFILE" ]; then
+        while IFS= read -r pid; do
+            [ -z "$pid" ] && continue
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  Force-killing stubborn process: PID $pid"
+                kill -9 "$pid" 2>/dev/null || true
+                SURVIVORS=true
+            fi
+        done < "$BAREMETAL_PIDFILE"
+    fi
+    echo "  Done killing bare-metal processes."
+else
+    echo "  (No bare-metal Dynamo processes found)"
+fi
+
 # Stop monitoring stack if --kill-metrics flag is set
 if [ "$KILL_METRICS" = true ]; then
     echo ""
@@ -162,5 +243,6 @@ echo "To restart:"
 echo "  Standard Unified:     bash start_dynamo_unified.sh"
 echo "  SGLang Thompson:      bash start_dynamo_optimized_thompson_hints_sglang.sh"
 echo "  vLLM Thompson:        bash start_dynamo_optimized_thompson_hints_vllm.sh"
+echo "  Cache Pinning:        bash start_dynamo_cache_pinning.sh"
 echo ""
 
