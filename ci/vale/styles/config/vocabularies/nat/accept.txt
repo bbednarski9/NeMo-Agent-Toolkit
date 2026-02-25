@@ -85,6 +85,7 @@ Grafana
 [Hh]yperparameter(s?)
 impactful
 [Ii]nferencing
+[Ii]nterarrival
 [Ii]nterquartile
 isort
 Jama
@@ -168,6 +169,7 @@ Qwen
 [Ss]andboxing
 [Ss]anitiz(e|ed|ation|ing)
 [Ss]erializable
+[Ss]erverless
 SGLang
 spaCy
 SQLAlchemy
@@ -185,6 +187,7 @@ Tavily
 [Tt]eardown
 [Tt]imestamp(s?)
 [Tt]okenization
+[Tt]oolchain
 [Tt]okenizer(s?)
 [Tt]rie(s?)
 triages
@@ -200,8 +203,7 @@ URIs
 uv
 Vanna
 VectorDB
-[Vv]llm
-[Vv]LLM
+vLLM
 [Ww]alkthrough
 [Ww]eb[Ss]ocket
 XGBoost
