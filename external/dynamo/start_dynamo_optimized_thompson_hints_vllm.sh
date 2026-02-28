@@ -154,6 +154,10 @@ MAX_NUM_SEQS="${DYNAMO_MAX_NUM_SEQS:-256}"
 # Set to a small number (e.g., 8-16) to force cache eviction behavior.
 # Leave empty/unset to use automatic calculation based on GPU memory.
 NUM_GPU_BLOCKS_OVERRIDE="${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE:-}"
+# Per-worker step for monotonically increasing KV cache blocks.
+# Worker i gets: NUM_GPU_BLOCKS_OVERRIDE + i * NUM_GPU_BLOCKS_STEP blocks.
+# Set to 0 for uniform cache sizes across all workers.
+NUM_GPU_BLOCKS_STEP="${DYNAMO_NUM_GPU_BLOCKS_STEP:-250}"
 
 # Compute container-internal GPU indices (GPUs are renumbered 0,1,2,... inside the container)
 NUM_GPUS=$(echo "$WORKER_GPUS" | tr ',' '\n' | wc -l)
@@ -280,7 +284,8 @@ if [ "$ENABLE_KV_EVENTS" = "true" ] && [ "$NUM_WORKERS" -gt 1 ]; then
     echo "    Per-worker ports: $KV_EVENT_BASE_PORT - $((KV_EVENT_BASE_PORT + NUM_WORKERS - 1))"
 fi
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ]; then
-    echo "  ⚠️  GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE (EXPERIMENT MODE - limited cache!)"
+    echo "  ⚠️  GPU Blocks Override (monotonic): base=$NUM_GPU_BLOCKS_OVERRIDE, step=$NUM_GPU_BLOCKS_STEP per worker"
+    echo "      Worker 0: $NUM_GPU_BLOCKS_OVERRIDE blocks → Worker $((NUM_WORKERS - 1)): $((NUM_GPU_BLOCKS_OVERRIDE + (NUM_WORKERS - 1) * NUM_GPU_BLOCKS_STEP)) blocks"
 fi
 echo ""
 echo "========================================================="
@@ -470,6 +475,14 @@ fi
 # Start container with optimized Thompson Sampling components
 echo ""
 echo "Starting Dynamo container with OPTIMIZED Thompson Sampling components (vLLM)..."
+# Persistent log directory on the HOST — processor overhead JSON Lines land here.
+# Access after a run:  cat $LOGS_HOST_DIR/processor_overhead.jsonl | head -5
+# Or load in pandas:   pd.read_json("processor_overhead.jsonl", lines=True)
+LOGS_HOST_DIR="${DYNAMO_LOGS_DIR:-${SCRIPT_DIR}/logs}"
+mkdir -p "$LOGS_HOST_DIR"
+chmod a+w "$LOGS_HOST_DIR"
+echo "Overhead logs → $LOGS_HOST_DIR"
+
 docker run -d \
   --name $CONTAINER_NAME \
   --gpus "\"device=${WORKER_GPUS}\"" \
@@ -481,6 +494,7 @@ docker run -d \
   -v $LOCAL_MODEL_DIR:$MODEL:ro \
   -v $CUSTOM_DYNAMO_DIR:/workspace/custom_dynamo:ro \
   -v ${SCRIPT_DIR}/monitoring/scripts:/workspace/monitoring/scripts:ro \
+  -v $LOGS_HOST_DIR:/workspace/logs \
   -e HF_TOKEN="$HF_TOKEN" \
   -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
   -e RUST_BACKTRACE=1 \
@@ -497,6 +511,7 @@ docker run -d \
   -e KV_EVENT_BASE_PORT=$KV_EVENT_BASE_PORT \
   -e DYNAMO_USE_MULTILRU=$DYNAMO_USE_MULTILRU \
   -e DYNAMO_WORKER_COMPONENT=backend \
+  -e PROCESSOR_OVERHEAD_LOG=/workspace/logs/processor_overhead.jsonl \
   $IMAGE \
   bash -c "
     set -e
@@ -660,7 +675,8 @@ docker run -d \
     if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
         echo \"GPU Blocks Override (heterogeneous): \$GPU_BLOCKS_CSV\"
     elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-        echo \"GPU Blocks Override (uniform): $NUM_GPU_BLOCKS_OVERRIDE (experiment mode - limited cache!)\"
+        echo \"GPU Blocks Override (monotonic): base=$NUM_GPU_BLOCKS_OVERRIDE, step=$NUM_GPU_BLOCKS_STEP per worker\"
+        echo \"  Worker 0: $NUM_GPU_BLOCKS_OVERRIDE blocks → Worker $(($NUM_WORKERS - 1)): $(($NUM_GPU_BLOCKS_OVERRIDE + ($NUM_WORKERS - 1) * $NUM_GPU_BLOCKS_STEP)) blocks\"
     fi
 
     # Start multiple workers, each using TP_SIZE GPUs
@@ -721,8 +737,9 @@ docker run -d \
                 echo \"  GPU Blocks Override: \$WORKER_BLOCKS\"
             fi
         elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE\"
-            echo \"  GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE\"
+            WORKER_BLOCKS=\$(($NUM_GPU_BLOCKS_OVERRIDE + \$i * $NUM_GPU_BLOCKS_STEP))
+            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override \$WORKER_BLOCKS\"
+            echo \"  GPU Blocks Override: \$WORKER_BLOCKS (base=$NUM_GPU_BLOCKS_OVERRIDE + worker_id=\$i * step=$NUM_GPU_BLOCKS_STEP)\"
         fi
         
         if [ \"\$ENABLE_KV_EVENTS\" = \"true\" ]; then

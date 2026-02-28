@@ -87,6 +87,10 @@ MAX_NUM_SEQS="${DYNAMO_MAX_NUM_SEQS:-256}"
 MAX_MODEL_LEN="${DYNAMO_MAX_MODEL_LEN:-}"
 # Hard override for the number of GPU KV cache blocks (unset = auto)
 NUM_GPU_BLOCKS_OVERRIDE="${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE:-}"
+# Per-worker step for monotonically increasing KV cache blocks.
+# Worker i gets: NUM_GPU_BLOCKS_OVERRIDE + i * NUM_GPU_BLOCKS_STEP blocks.
+# Set to 0 for uniform cache sizes across all workers.
+NUM_GPU_BLOCKS_STEP="${DYNAMO_NUM_GPU_BLOCKS_STEP:-250}"
 
 # Compute container-internal GPU indices (GPUs are renumbered 0,1,2,... inside the container)
 NUM_GPUS=$(echo "$WORKER_GPUS" | tr ',' '\n' | wc -l)
@@ -357,6 +361,12 @@ if [ ! -d "$LOCAL_MODEL_DIR" ]; then
     fi
 fi
 
+# Persistent log directory on the HOST (mirrors Thompson script for consistent tooling).
+LOGS_HOST_DIR="${DYNAMO_LOGS_DIR:-${SCRIPT_DIR}/logs}"
+mkdir -p "$LOGS_HOST_DIR"
+chmod a+w "$LOGS_HOST_DIR"
+echo "Logs dir → $LOGS_HOST_DIR"
+
 # Start container with unified vLLM worker + Dynamo frontend
 echo ""
 echo "Starting Dynamo container with unified vLLM worker + frontend..."
@@ -369,6 +379,7 @@ docker run -d \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
   -v $LOCAL_MODEL_DIR:$MODEL:ro \
+  -v $LOGS_HOST_DIR:/workspace/logs \
   -e HF_TOKEN="$HF_TOKEN" \
   -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
   -e RUST_BACKTRACE=1 \
@@ -482,7 +493,8 @@ docker run -d \
     if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
         echo \"GPU Blocks Override (heterogeneous): \$GPU_BLOCKS_CSV\"
     elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-        echo \"GPU Blocks Override (uniform): $NUM_GPU_BLOCKS_OVERRIDE (experiment mode - limited cache!)\"
+        echo \"GPU Blocks Override (monotonic): base=$NUM_GPU_BLOCKS_OVERRIDE, step=$NUM_GPU_BLOCKS_STEP per worker\"
+        echo \"  Worker 0: $NUM_GPU_BLOCKS_OVERRIDE blocks → Worker $(($NUM_WORKERS - 1)): $(($NUM_GPU_BLOCKS_OVERRIDE + ($NUM_WORKERS - 1) * $NUM_GPU_BLOCKS_STEP)) blocks\"
     fi
 
     # Start multiple workers, each using TP_SIZE GPUs
@@ -513,8 +525,9 @@ docker run -d \
                 echo \"  GPU Blocks Override: \$WORKER_BLOCKS\"
             fi
         elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE\"
-            echo \"  GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE\"
+            WORKER_BLOCKS=\$(($NUM_GPU_BLOCKS_OVERRIDE + \$i * $NUM_GPU_BLOCKS_STEP))
+            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override \$WORKER_BLOCKS\"
+            echo \"  GPU Blocks Override: \$WORKER_BLOCKS (base=$NUM_GPU_BLOCKS_OVERRIDE + worker_id=\$i * step=$NUM_GPU_BLOCKS_STEP)\"
         fi
 
         # DYN_SYSTEM_PORT: unique Prometheus metrics port per worker

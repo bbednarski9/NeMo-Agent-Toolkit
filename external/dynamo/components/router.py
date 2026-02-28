@@ -59,7 +59,8 @@ from dynamo.runtime.logging import configure_dynamo_logging
 # Falls back gracefully to empty scores if dynamo.llm primitives are unavailable.
 from kv_indexer import KvIndexer
 from kv_indexer import OverlapScores
-from pydantic import BaseModel
+from learners import BetaLearner, LatencyTracker, LinTSLearner, PendingDecisions
+from pydantic import BaseModel, field_validator
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -113,6 +114,7 @@ def get_builtin_defaults() -> dict[str, Any]:
         },
         "exploration": {
             "base_ts_weight": 0.10,
+            "beta_decay": 1.0,
             "temperature": {
                 "base": 1.0,
                 "min": 0.15,
@@ -145,6 +147,7 @@ def get_builtin_defaults() -> dict[str, Any]:
             "sweep_interval_seconds": 5.0,
             "timeout_reward": 0.0,
             "latency_ema_alpha": 0.2,
+            "reward_baseline_mode": "global",
         },
         "debug": {
             "traces_enabled": False,
@@ -384,12 +387,36 @@ def _init_prometheus_metrics():
 
 
 # ---------------------- request / response models ---------------------- #
+_OSL_CAT_TO_INT: dict[str, int] = {"LOW": 128, "MEDIUM": 250, "HIGH": 1024}
+_IAT_CAT_TO_INT: dict[str, int] = {"LOW": 50, "MEDIUM": 250, "HIGH": 1000}
+
+
+def _cat_or_int(value: str | int | None, cat_lut: dict[str, int], default: int) -> int:
+    """Accept int pass-through or convert a category string to its int value."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().upper()
+    return cat_lut.get(s, default)
+
+
 class RouterRequest(BaseModel):
     tokens: list[int]
     prefix_id: str = "<no_reuse>"
     reuse_budget: int = 0  # remaining *after this request*
-    expected_osl: str | None = "MEDIUM"
-    interarrival: str | None = "MEDIUM"
+    expected_osl: int = 250
+    interarrival: int = 250
+
+    @field_validator("expected_osl", mode="before")
+    @classmethod
+    def _normalise_osl(cls, v: str | int | None) -> int:
+        return _cat_or_int(v, _OSL_CAT_TO_INT, default=250)
+
+    @field_validator("interarrival", mode="before")
+    @classmethod
+    def _normalise_iat(cls, v: str | int | None) -> int:
+        return _cat_or_int(v, _IAT_CAT_TO_INT, default=250)
 
 
 class RouterResponse(BaseModel):
@@ -470,12 +497,15 @@ class WorkloadAwareRouter:
         lints_lambda: float = 1.0,
         lints_v: float = 0.25,
         lints_forget: float = 0.995,
+        # Beta bandit
+        beta_decay: float = 1.0,
         # ---------- Feedback timeout / sweep ----------
         feedback_timeout_seconds: float = 120.0,
         pending_sweep_interval_seconds: float = 5.0,
         timeout_reward: float = 0.0,
         # ---------- Latency EMA (reward normalization) ----------
         latency_ema_alpha: float = 0.2,
+        reward_baseline_mode: str = "global",
         # ---------- kv_load (Dynamo-native formula) ----------
         kv_load_overlap_weight: float = 1.0,
         kv_load_temperature: float = 0.0,
@@ -518,27 +548,30 @@ class WorkloadAwareRouter:
         self.engine_client = None
         self.indexer: KvIndexer | None = None
 
-        # concurrency primitives
+        # concurrency primitives (learner-specific locks are inside learner objects)
         self._init_lock = threading.Lock()
-        self._bandit_lock = threading.Lock()
         self._prefix_lock = threading.Lock()
-        self._lin_lock = threading.Lock()
-        self._pending_lock = threading.Lock()
 
         # prefix state: pid -> {"worker": int|None, "reuse_remaining": int}
         self.prefix_cache_state: dict[str, dict[str, int | None]] = {}
         # pid -> {"decode_cost","prefill_cost","iat_factor"}
         self.prefix_meta: dict[str, dict[str, float]] = {}
 
-        # Beta bandits and LinTS params
-        self.worker_bandits: dict[int, tuple[float, float]] = {}
+        # Modular learner components
         self.feature_dim = 9
-        self.lin_lambda = float(lints_lambda)
-        self.lin_v = float(lints_v)
-        self.lin_forget = float(lints_forget)
-        self.lin_forget = max(1e-6, min(self.lin_forget, 0.999999))
-        self.linA: dict[int, np.ndarray] = {}
-        self.linb: dict[int, np.ndarray] = {}
+        self.beta_learner = BetaLearner(decay=float(beta_decay))
+        self.lints_learner = LinTSLearner(
+            feature_dim=self.feature_dim,
+            lambda_=float(lints_lambda),
+            v=float(lints_v),
+            forget_rate=float(lints_forget),
+        )
+        self.latency_tracker = LatencyTracker(ema_alpha=float(latency_ema_alpha))
+        self.reward_baseline_mode = str(reward_baseline_mode)
+        # Kept for backward-compat references inside router
+        self.lin_lambda = self.lints_learner.lambda_
+        self.lin_v = self.lints_learner.v
+        self.lin_forget = self.lints_learner.forget_rate
 
         # knobs
         self.affinity_base = float(affinity_base)
@@ -560,29 +593,18 @@ class WorkloadAwareRouter:
         self.prefill_token_scale = float(prefill_token_scale)
         self.prefill_weight = float(prefill_weight)
 
-        # LinTS numerics
-        self._jt_base = 1e-9
-        self._jt_mult = 10.0
-        self._jt_max = 1e-3
-        self._eig_floor = 1e-10
-
         # Feedback timeout / sweep
         self.feedback_timeout_seconds = float(feedback_timeout_seconds)
         self.pending_sweep_interval_seconds = float(pending_sweep_interval_seconds)
         self.timeout_reward = float(max(0.0, min(1.0, timeout_reward)))
-        self._last_pending_sweep = 0.0
+        self.pending_decisions = PendingDecisions(
+            timeout_seconds=self.feedback_timeout_seconds,
+            sweep_interval_seconds=self.pending_sweep_interval_seconds,
+        )
 
-        # Latency EMA baselines (two modes: raw ms, or ms/token)
-        self.latency_ema_alpha = float(latency_ema_alpha)
-        # Global (per-mode)
-        self.lat_ema_global: dict[bool, float | None] = {False: None, True: None}
-        # Per worker (per-mode)
-        self.lat_ema_worker: dict[tuple[int, bool], float] = {}
-        # Per bucket (per-mode): (wid, osl, prefill_bin, per_tok) -> value
-        self.lat_ema_bucket: dict[tuple[int, str, str, bool], float] = {}
-
-        # Pending decisions waiting for feedback
-        self.pending: dict[str, dict[str, Any]] = {}
+        # Backward-compat alias — existing code referencing self.pending
+        # now goes through the PendingDecisions wrapper.
+        self.pending = self.pending_decisions._pending
 
         # Cold-start round-robin counter for kv_only / kv_load_balanced modes
         self._cold_start_rr: int = 0
@@ -648,21 +670,45 @@ class WorkloadAwareRouter:
         except Exception as e:
             logger.debug("Trace write failed: %s", e)
 
-    # --------------------- level mappings --------------------- #
+    # --------------------- level mappings (continuous) --------------------- #
     @staticmethod
-    def _norm_level(s: str | None, default: str = "MEDIUM") -> str:
-        if not s:
-            return default
-        s = str(s).strip().upper()
-        return s if s in ("LOW", "MEDIUM", "HIGH") else default
+    def _decode_cost(osl: int) -> float:
+        """Linearly interpolate decode cost from continuous OSL (tokens).
+
+        Anchor points: 128 -> 1.0, 250 -> 2.0, 1024 -> 3.0
+        Values outside the range are clamped.
+        """
+        if osl <= 128:
+            return 1.0
+        if osl <= 250:
+            return 1.0 + (osl - 128) / (250 - 128)
+        if osl >= 1024:
+            return 3.0
+        return 2.0 + (osl - 250) / (1024 - 250)
 
     @staticmethod
-    def _decode_cost(osl: str) -> float:
-        return {"LOW": 1.0, "MEDIUM": 2.0, "HIGH": 3.0}[osl]
+    def _iat_factor(iat: int) -> float:
+        """Linearly interpolate IAT factor from continuous IAT (ms).
+
+        Anchor points: 50 -> 1.5, 250 -> 1.0, 1000 -> 0.6
+        Values outside the range are clamped.
+        """
+        if iat <= 50:
+            return 1.5
+        if iat <= 250:
+            return 1.5 - 0.5 * (iat - 50) / (250 - 50)
+        if iat >= 1000:
+            return 0.6
+        return 1.0 - 0.4 * (iat - 250) / (1000 - 250)
 
     @staticmethod
-    def _iat_factor(iat: str) -> float:
-        return {"LOW": 1.5, "MEDIUM": 1.0, "HIGH": 0.6}[iat]
+    def _osl_bin(osl: int) -> str:
+        """Bucket continuous OSL into LOW/MEDIUM/HIGH for latency baseline keys."""
+        if osl <= 189:
+            return "LOW"
+        if osl <= 637:
+            return "MEDIUM"
+        return "HIGH"
 
     # --------------------- init --------------------- #
     async def initialize(self):
@@ -806,8 +852,7 @@ class WorkloadAwareRouter:
     def _initialize_bandits(self):
         for wid in self.engine_client.instance_ids():
             wid = int(wid)
-            self.worker_bandits.setdefault(wid, (1.0, 1.0))
-            # Update Prometheus metrics
+            self.beta_learner.add_worker(wid)
             if self._metrics.get("beta_alpha"):
                 self._metrics["beta_alpha"].labels(worker_id=str(wid)).set(1.0)
             if self._metrics.get("beta_beta"):
@@ -817,16 +862,7 @@ class WorkloadAwareRouter:
     def _initialize_contextual(self):
         for wid in self.engine_client.instance_ids():
             wid = int(wid)
-            if wid not in self.linA:
-                self.linA[wid] = self.lin_lambda * np.eye(self.feature_dim, dtype=np.float64)
-                self.linb[wid] = np.zeros(self.feature_dim, dtype=np.float64)
-
-    def _ensure_worker_context(self, worker_id: int):
-        if worker_id not in self.linA:
-            with self._lin_lock:
-                if worker_id not in self.linA:
-                    self.linA[worker_id] = self.lin_lambda * np.eye(self.feature_dim, dtype=np.float64)
-                    self.linb[worker_id] = np.zeros(self.feature_dim, dtype=np.float64)
+            self.lints_learner.add_worker(wid)
 
     # --------------------- prefix state --------------------- #
     @safe_update("_prefix_lock")
@@ -969,12 +1005,8 @@ class WorkloadAwareRouter:
         reacts within the same function call.
         """
         # Count in-flight (pending) decisions per worker.
-        pending_per_worker: dict[int, int] = {wid: 0 for wid in worker_ids}
-        with self._pending_lock:
-            for rec in self.pending.values():
-                w = int(rec.get("wid", -1))
-                if w in pending_per_worker:
-                    pending_per_worker[w] += 1
+        raw_counts = self.pending_decisions.per_worker_counts()
+        pending_per_worker: dict[int, int] = {wid: raw_counts.get(wid, 0) for wid in worker_ids}
 
         sorted_ids = sorted(worker_ids)
         endpoints = []
@@ -1012,68 +1044,18 @@ class WorkloadAwareRouter:
 
         return {"endpoints": endpoints}
 
-    # --------------------- bandits --------------------- #
+    # --------------------- bandits (delegated to learners) --------------------- #
     def _linTS_sample(self, wid: int, x: np.ndarray) -> float:
-        self._ensure_worker_context(wid)
-        with self._lin_lock:
-            A = np.array(self.linA[wid], dtype=np.float64, copy=True)
-            b = np.array(self.linb[wid], dtype=np.float64, copy=True)
-
-        A = 0.5 * (A + A.T)
-        eye = np.eye(self.feature_dim, dtype=np.float64)
-        jitter = self._jt_base
-        L = None
-        while True:
-            try:
-                L = np.linalg.cholesky(A + jitter * eye)
-                break
-            except np.linalg.LinAlgError:
-                jitter = jitter * self._jt_mult if jitter > 0 else self._jt_base
-                if jitter > self._jt_max:
-                    vals, vecs = np.linalg.eigh(A)
-                    vals = np.maximum(vals, self._eig_floor)
-                    A_inv = vecs @ (np.diag(1.0 / vals)) @ vecs.T
-                    mu = A_inv @ b
-                    z = np.random.normal(size=self.feature_dim)
-                    noise = vecs @ (z / np.sqrt(vals))
-                    theta = mu + (self.lin_v * noise)
-                    return float(theta @ x)
-
-        y = np.linalg.solve(L, b)
-        mu = np.linalg.solve(L.T, y)
-        z = np.random.normal(size=self.feature_dim)
-        noise = np.linalg.solve(L.T, z)
-        theta = mu + (self.lin_v * noise)
-        return float(theta @ x)
+        return self.lints_learner.sample(wid, x)
 
     def _update_contextual(self, wid: int, x: np.ndarray, reward: float):
-        r = float(max(0.0, min(1.0, reward)))
-        with self._lin_lock:
-            A = self.linA[wid]
-            b = self.linb[wid]
-            A *= self.lin_forget
-            b *= self.lin_forget
-            A += np.outer(x, x)
-            ridge = (1.0 - self.lin_forget) * self.lin_lambda
-            if ridge > 0.0:
-                A += ridge * np.eye(self.feature_dim, dtype=np.float64)
-            self.linA[wid] = 0.5 * (A + A.T)
-            self.linb[wid] = b + x * r
+        self.lints_learner.update(wid, x, reward)
 
     def _ts_sample(self, worker_id: int) -> float:
-        with self._bandit_lock:
-            alpha, beta = self.worker_bandits.get(worker_id, (1.0, 1.0))
-        return np.random.beta(alpha, beta)
+        return self.beta_learner.sample(worker_id)
 
     def _update_bandit(self, worker_id: int, reward: float):
-        with self._bandit_lock:
-            alpha, beta = self.worker_bandits.get(worker_id, (1.0, 1.0))
-            r = float(max(0.0, min(1.0, reward)))
-            new_alpha = alpha + r
-            new_beta = beta + 1.0 - r
-            self.worker_bandits[worker_id] = (new_alpha, new_beta)
-
-        # Update Prometheus metrics
+        new_alpha, new_beta = self.beta_learner.update(worker_id, reward)
         if self._metrics.get("beta_alpha"):
             self._metrics["beta_alpha"].labels(worker_id=str(worker_id)).set(new_alpha)
         if self._metrics.get("beta_beta"):
@@ -1171,13 +1153,11 @@ class WorkloadAwareRouter:
         metrics: dict[str, Any] | None,
         scores: OverlapScores,
     ) -> tuple[int, dict[str, float], dict[int, dict[str, float]], list[float], list[float]]:
-        osl = self._norm_level(req.expected_osl, "MEDIUM")
-        iat = self._norm_level(req.interarrival, "MEDIUM")
         last_w, _ = self._get_prefix(req.prefix_id)
 
         reuse_after = max(int(req.reuse_budget), 0)
-        decode_cost = self._decode_cost(osl)
-        iat_factor = self._iat_factor(iat)
+        decode_cost = self._decode_cost(req.expected_osl)
+        iat_factor = self._iat_factor(req.interarrival)
 
         # ---- kv_only: route purely on KV overlap scores ---- #
         if self.router_type == "kv_only":
@@ -1584,59 +1564,29 @@ class WorkloadAwareRouter:
 
         return chosen, per_worker_ctx[chosen], per_worker_ctx, raw_scores, probs
 
-    # --------------------- latency baselines & reward --------------------- #
-    def _ema_update(self, old: float | None, new: float) -> float:
-        a = self.latency_ema_alpha
-        return new if old is None else (a * new + (1.0 - a) * old)
-
+    # --------------------- latency baselines & reward (delegated) --------------------- #
     def _get_latency_baseline(self, wid: int, osl: str, prefill_bin: str, per_tok: bool, fallback: float) -> float:
-        key_b = (wid, osl, prefill_bin, per_tok)
-        key_w = (wid, per_tok)
-        if key_b in self.lat_ema_bucket:
-            return self.lat_ema_bucket[key_b]
-        if key_w in self.lat_ema_worker:
-            return self.lat_ema_worker[key_w]
-        if self.lat_ema_global[per_tok] is not None:
-            return self.lat_ema_global[per_tok]  # type: ignore
-        return max(1.0, float(fallback))
+        return self.latency_tracker.get_baseline(wid, osl, prefill_bin, per_tok, fallback)
 
     def _update_latency_baselines(self, wid: int, osl: str, prefill_bin: str, metric: float, per_tok: bool) -> float:
-        self.lat_ema_global[per_tok] = self._ema_update(self.lat_ema_global[per_tok], metric)
-        key_w = (wid, per_tok)
-        self.lat_ema_worker[key_w] = self._ema_update(self.lat_ema_worker.get(key_w), metric)
-        key_b = (wid, osl, prefill_bin, per_tok)
-        self.lat_ema_bucket[key_b] = self._ema_update(self.lat_ema_bucket.get(key_b), metric)
-        return self.lat_ema_bucket[key_b]
+        return self.latency_tracker.update_baselines(wid, osl, prefill_bin, metric, per_tok)
 
     @staticmethod
     def _latency_metric(latency_ms: float, tokens_out: int | None) -> tuple[float, bool]:
-        if tokens_out is not None and int(tokens_out) > 0:
-            return float(latency_ms) / float(max(1, int(tokens_out))), True
-        return float(latency_ms), False
+        return LatencyTracker.latency_metric(latency_ms, tokens_out)
 
     @staticmethod
     def _metric_to_reward(metric: float, baseline: float, success: bool) -> float:
-        if not success:
-            return 0.0
-        denom = max(1e-3, baseline)
-        ratio = metric / denom
-        return float(1.0 / (1.0 + ratio))
+        return LatencyTracker.compute_reward(metric, baseline, success)
 
     # --------------------- timeout sweep --------------------- #
     def _sweep_pending(self, now: float):
-        if now - self._last_pending_sweep < self.pending_sweep_interval_seconds:
+        expired = self.pending_decisions.sweep(now)
+        if not expired:
             return
-        self._last_pending_sweep = now
-        expired: list[tuple[str, dict[str, Any]]] = []
-        with self._pending_lock:
-            for did, rec in list(self.pending.items()):
-                if now - float(rec.get("start_ts", now)) >= self.feedback_timeout_seconds:
-                    expired.append((did, rec))
-                    self.pending.pop(did, None)
 
-            # Update pending count metric
-            if self._metrics.get("pending_decisions"):
-                self._metrics["pending_decisions"].set(len(self.pending))
+        if self._metrics.get("pending_decisions"):
+            self._metrics["pending_decisions"].set(self.pending_decisions.count())
 
         for did, rec in expired:
             wid = int(rec["wid"])
@@ -1702,12 +1652,10 @@ class WorkloadAwareRouter:
         prev_consecutive = int(self.prefix_cache_state.get(req.prefix_id, {}).get("consecutive", 0))
         consecutive = prev_consecutive + 1 if last_w == chosen else 1
 
-        osl = self._norm_level(req.expected_osl, "MEDIUM")
-        iat = self._norm_level(req.interarrival, "MEDIUM")
-        decode_cost = self._decode_cost(osl)
+        decode_cost = self._decode_cost(req.expected_osl)
         overlap_chosen = float(scores.scores.get(chosen, 0.0))
         prefill_cost_chosen = self._prefill_cost_for_worker(req.tokens, overlap_chosen)
-        iat_factor = self._iat_factor(iat)
+        iat_factor = self._iat_factor(req.interarrival)
 
         # Update prefix state
         self._set_prefix(
@@ -1732,24 +1680,22 @@ class WorkloadAwareRouter:
             iat_factor=iat_factor,
         )
         decision_id = uuid.uuid4().hex
-        with self._pending_lock:
-            self.pending[decision_id] = {
-                "wid": int(chosen),
-                "x": x,
-                "osl": osl,
-                "prefill_bin": self._prefill_bin(prefill_cost_chosen),
-                "start_ts": now,
-                "prefix_id": req.prefix_id,
-                "tokens_in": len(req.tokens),
-                "reuse_after": int(req.reuse_budget),
-                "overlap": overlap_chosen,
-                "prefill_cost": float(prefill_cost_chosen),
-                "decode_cost": float(decode_cost),
-                "consecutive": consecutive,
-            }
-            # Update pending count metric
-            if self._metrics.get("pending_decisions"):
-                self._metrics["pending_decisions"].set(len(self.pending))
+        self.pending_decisions.add(decision_id, {
+            "wid": int(chosen),
+            "x": x,
+            "osl": self._osl_bin(req.expected_osl),
+            "prefill_bin": self._prefill_bin(prefill_cost_chosen),
+            "start_ts": now,
+            "prefix_id": req.prefix_id,
+            "tokens_in": len(req.tokens),
+            "reuse_after": int(req.reuse_budget),
+            "overlap": overlap_chosen,
+            "prefill_cost": float(prefill_cost_chosen),
+            "decode_cost": float(decode_cost),
+            "consecutive": consecutive,
+        })
+        if self._metrics.get("pending_decisions"):
+            self._metrics["pending_decisions"].set(self.pending_decisions.count())
 
         # Update Prometheus metrics
         if self._metrics.get("decisions_total"):
@@ -1795,9 +1741,9 @@ class WorkloadAwareRouter:
             req.prefix_id,
             last_w,
             req.reuse_budget,
-            osl,
+            req.expected_osl,
             prefill_cost_chosen,
-            iat,
+            req.interarrival,
             overlap_chosen,
             consecutive,
         )
@@ -1816,11 +1762,9 @@ class WorkloadAwareRouter:
             yield ack.model_dump()
             return
 
-        with self._pending_lock:
-            decision = self.pending.pop(fb.decision_id, None)
-            # Update pending count metric
-            if self._metrics.get("pending_decisions"):
-                self._metrics["pending_decisions"].set(len(self.pending))
+        decision = self.pending_decisions.pop(fb.decision_id)
+        if self._metrics.get("pending_decisions"):
+            self._metrics["pending_decisions"].set(self.pending_decisions.count())
 
         if not decision:
             ack = FeedbackAck(ok=False, used_baseline=0.0, reward=0.0, error="unknown_decision")
@@ -1834,15 +1778,26 @@ class WorkloadAwareRouter:
         elapsed_ms = (time.time() - decision.get("start_ts", time.time())) * 1000
         consecutive: int = int(decision.get("consecutive", 0))
         tokens_out = None if fb.tokens_out is None else int(fb.tokens_out)
-        metric, per_tok = self._latency_metric(float(fb.latency_ms), tokens_out)
+        metric, per_tok = LatencyTracker.latency_metric(float(fb.latency_ms), tokens_out)
 
-        # Baseline lookup (hierarchical)
-        baseline_before = self._get_latency_baseline(wid, osl, prefill_bin, per_tok, fallback=metric)
-        reward = self._metric_to_reward(metric, baseline_before, bool(fb.success))
+        # Baseline for reward: mode selects which EMA level is used.
+        # "global" (default) uses a shared baseline so fast workers get
+        # higher rewards than slow ones.  "hierarchical" uses per-worker
+        # baselines (legacy — equalizes rewards).  "blended" mixes both.
+        if self.reward_baseline_mode == "global":
+            baseline_before = self.latency_tracker.get_global_baseline(per_tok, fallback=metric)
+        elif self.reward_baseline_mode == "blended":
+            global_bl = self.latency_tracker.get_global_baseline(per_tok, fallback=metric)
+            worker_bl = self.latency_tracker.get_baseline(wid, osl, prefill_bin, per_tok, fallback=metric)
+            baseline_before = 0.7 * global_bl + 0.3 * worker_bl
+        else:
+            baseline_before = self.latency_tracker.get_baseline(wid, osl, prefill_bin, per_tok, fallback=metric)
+        reward = LatencyTracker.compute_reward(metric, baseline_before, bool(fb.success))
 
-        # Update EMAs only on successes
+        # Update all three EMA levels (global, worker, bucket) regardless
+        # of which mode was used for reward — keeps diagnostics available.
         if fb.success:
-            baseline_after = self._update_latency_baselines(wid, osl, prefill_bin, metric, per_tok)
+            baseline_after = self.latency_tracker.update_baselines(wid, osl, prefill_bin, metric, per_tok)
         else:
             baseline_after = baseline_before
 
@@ -2169,11 +2124,14 @@ async def worker(runtime: DistributedRuntime):
         lints_lambda=get_nested(config, "lints.lambda", 1.0),
         lints_v=get_nested(config, "lints.v", 0.25),
         lints_forget=get_nested(config, "lints.forget_rate", 0.995),
+        # Beta bandit
+        beta_decay=get_nested(config, "exploration.beta_decay", 1.0),
         # Feedback
         feedback_timeout_seconds=get_nested(config, "feedback.timeout_seconds", 120.0),
         pending_sweep_interval_seconds=get_nested(config, "feedback.sweep_interval_seconds", 5.0),
         timeout_reward=get_nested(config, "feedback.timeout_reward", 0.0),
         latency_ema_alpha=get_nested(config, "feedback.latency_ema_alpha", 0.2),
+        reward_baseline_mode=get_nested(config, "feedback.reward_baseline_mode", "global"),
         # kv_load (Dynamo-native)
         kv_load_overlap_weight=get_nested(config, "kv_load.overlap_score_weight", 1.0),
         kv_load_temperature=get_nested(config, "kv_load.temperature", 0.0),

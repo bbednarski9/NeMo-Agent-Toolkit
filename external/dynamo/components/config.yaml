@@ -33,6 +33,7 @@ affinity:
 # Exploration settings - controls explore vs exploit tradeoff
 exploration:
   base_ts_weight: 0.10    # Weight for Thompson Sampling exploration term
+  beta_decay: 0.995       # Exponential decay for Beta bandit (1.0 = no forgetting, 0.995 = window ≈ 200 obs, half-life ≈ 138)
   temperature:
     base: 1.0             # Base softmax temperature (CLI: --temp-base)
     min: 0.15             # Minimum temperature (more greedy)
@@ -69,6 +70,9 @@ feedback:
   sweep_interval_seconds: 5.0     # How often to check for timed-out decisions
   timeout_reward: 0.0             # Reward assigned to timed-out decisions (0.0 = bad)
   latency_ema_alpha: 0.2          # EMA smoothing factor for latency baselines
+  reward_baseline_mode: global    # Baseline for reward computation: "global" (recommended — shared
+                                  # across workers, enables differentiation), "hierarchical" (legacy —
+                                  # per-worker baselines, equalizes rewards), "blended" (70/30 mix)
 
 # KV Load mode — replicates Dynamo's native DefaultWorkerSelector formula:
 #   logit = overlap_weight * potential_prefill_blocks + decode_blocks
@@ -146,7 +150,7 @@ kv_thompson:
   enable_lints: true          # LinTS contextual bandit (ISL/OSL-aware exploration)
   enable_affinity: true       # Prefix stickiness bonus for multi-turn sessions
   enable_switching_cost: true # Penalty for migrating a prefix to a different worker
-  enable_full_load: false      # 5-param load model (gpu + queue + outstanding + coupling terms)
+  enable_full_load: true      # 5-param load model (gpu + queue + outstanding + coupling terms)
   enable_adaptive_temp: true  # Temperature decays with reuse_after (greedier late in session)
   enable_adaptive_explore: true # Beta-TS weight decays with reuse_after
   enable_sticky_floor: false   # Protect sticky worker's load_mod minimum
