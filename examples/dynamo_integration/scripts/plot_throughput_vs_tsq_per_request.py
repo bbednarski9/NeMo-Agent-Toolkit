@@ -509,7 +509,8 @@ def collect_job_data(input_dirs: list[Path]) -> tuple[pd.DataFrame, pd.DataFrame
 def create_scatter_plots(df: pd.DataFrame,
                          output_dir: Path,
                          color_by: str | None = None,
-                         llm_call_df: pd.DataFrame | None = None):
+                         llm_call_df: pd.DataFrame | None = None,
+                         consolidate_legend: bool = False):
     """Create scatter plots of per-request throughput metrics vs TSQ score.
 
     Args:
@@ -533,7 +534,7 @@ def create_scatter_plots(df: pd.DataFrame,
 
     # Check if we have multiple experiments (fallback if no color_by)
     experiments = df['experiment'].unique() if 'experiment' in df.columns else ['default']
-    multi_experiment = len(experiments) > 1 and not use_color_by
+    multi_experiment = len(experiments) > 1 and not use_color_by and not consolidate_legend
 
     # Create color map
     if use_color_by:
@@ -622,7 +623,7 @@ def create_scatter_plots(df: pd.DataFrame,
         print(f"  Saved: {output_path}")
 
     # Create a combined summary plot
-    create_summary_plot(df, output_dir, color_by, llm_call_df)
+    create_summary_plot(df, output_dir, color_by, llm_call_df, consolidate_legend=consolidate_legend)
 
     # Save the collected data as CSV
     csv_path = output_dir / 'throughput_vs_tsq_per_request_data.csv'
@@ -639,7 +640,8 @@ def create_scatter_plots(df: pd.DataFrame,
 def create_summary_plot(df: pd.DataFrame,
                         output_dir: Path,
                         color_by: str | None = None,
-                        llm_call_df: pd.DataFrame | None = None):
+                        llm_call_df: pd.DataFrame | None = None,
+                        consolidate_legend: bool = False):
     """Create a multi-panel summary plot.
 
     Top row shows per-LLM-call metrics (TTFT, ITL, Throughput) if llm_call_df is provided,
@@ -660,7 +662,7 @@ def create_summary_plot(df: pd.DataFrame,
     use_color_by = color_by and color_by in df.columns
 
     experiments = df['experiment'].unique() if 'experiment' in df.columns else ['default']
-    multi_experiment = len(experiments) > 1 and not use_color_by
+    multi_experiment = len(experiments) > 1 and not use_color_by and not consolidate_legend
 
     # Create color map
     if use_color_by:
@@ -831,8 +833,13 @@ def create_summary_plot(df: pd.DataFrame,
     title_suffix = f' (by {color_by})' if use_color_by else ''
     n_requests = len(df)
     n_llm_calls = len(llm_call_df) if has_llm_call_data else 'N/A'
+    n_experiments = len(experiments)
+    if consolidate_legend and n_experiments > 1:
+        domain_info = f'{n_experiments} domains combined'
+    else:
+        domain_info = f'{n_experiments} experiment{"s" if n_experiments > 1 else ""}'
     plt.suptitle(
-        f'Throughput Metrics vs TSQ{title_suffix}\n'
+        f'Throughput Metrics vs TSQ{title_suffix} ({domain_info})\n'
         f'Top row: Per-LLM-Call ({n_llm_calls} calls), '
         f'Bottom row: Per-Request ({n_requests} requests)',
         fontsize=14,
@@ -887,6 +894,11 @@ Features:
                         type=str,
                         default=None,
                         help='Column to use for coloring points (e.g., "temperature" from optimizer trials)')
+    parser.add_argument('--consolidate-legend',
+                        action='store_true',
+                        default=False,
+                        help='Show a single aggregate stats legend entry instead of one per experiment/domain. '
+                        'Useful when plotting many domains where per-domain stats become unreadable.')
 
     args = parser.parse_args()
 
@@ -966,10 +978,13 @@ Features:
 
     # Create plots
     print("Creating plots...")
+    if args.consolidate_legend:
+        print("  Legend mode: consolidated (single aggregate stats entry)")
     create_scatter_plots(df,
                          output_dir,
                          color_by=args.color_by,
-                         llm_call_df=llm_call_df if not llm_call_df.empty else None)
+                         llm_call_df=llm_call_df if not llm_call_df.empty else None,
+                         consolidate_legend=args.consolidate_legend)
 
     print(f"\nDone! Plots saved to: {output_dir}")
 

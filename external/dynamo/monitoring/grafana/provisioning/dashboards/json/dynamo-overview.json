@@ -714,7 +714,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Detailed KV cache metrics per worker including KVES proxy (prefix hit rate), memory usage, token counts, and capacity.",
+      "description": "Detailed KV cache metrics per worker including KVES proxy (prefix hit rate), locked (non-evictable) KV usage, token counts, and capacity.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -861,12 +861,12 @@
         },
         {
           "expr": "avg_over_time(${backend}:token_usage[1m]) * 100",
-          "legendFormat": "KV Usage % ({{instance}})",
+          "legendFormat": "Locked KV % ({{instance}})",
           "refId": "B"
         },
         {
           "expr": "last_over_time(${backend}:num_used_tokens[1m])",
-          "legendFormat": "KV Tokens Used ({{instance}})",
+          "legendFormat": "Locked KV Tokens ({{instance}})",
           "refId": "C"
         },
         {
@@ -994,7 +994,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "KV cache memory utilization (%, left axis) and token count (right axis) per worker.",
+      "description": "Locked (non-evictable) KV cache utilization (%, left axis) and locked token count (right axis) per worker. Excludes reclaimable prefix cache blocks.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1003,7 +1003,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Usage %",
+            "axisLabel": "Locked KV %",
             "axisPlacement": "left",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -1126,16 +1126,16 @@
       "targets": [
         {
           "expr": "${backend}:token_usage * 100",
-          "legendFormat": "Usage % ({{instance}})",
+          "legendFormat": "Locked KV % ({{instance}})",
           "refId": "A"
         },
         {
           "expr": "${backend}:num_used_tokens",
-          "legendFormat": "Tokens ({{instance}})",
+          "legendFormat": "Locked Tokens ({{instance}})",
           "refId": "B"
         }
       ],
-      "title": "KV Cache Usage & Tokens",
+      "title": "Locked KV Cache (Active Sequences)",
       "type": "timeseries"
     }
   ],

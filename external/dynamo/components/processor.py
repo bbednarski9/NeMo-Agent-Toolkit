@@ -103,7 +103,9 @@ KVE metrics require the underlying engine to return cache efficiency data:
 
 import argparse
 import asyncio
+import json
 import logging
+import logging.handlers
 import os
 import time
 import uuid
@@ -128,6 +130,38 @@ configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
 
+# ----------------------- overhead file logger ----------------------- #
+def _setup_overhead_logger(log_path: str = "/tmp/processor_overhead.jsonl") -> logging.Logger:
+    """
+    Set up a dedicated JSON Lines file logger for NATS / routing overhead.
+
+    Each record is a single JSON object on one line.  Load for analysis with:
+
+        import pandas as pd
+        df = pd.read_json("/tmp/processor_overhead.jsonl", lines=True)
+
+    The logger rotates at 50 MB and keeps 5 backups so it never fills disk.
+    """
+    os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
+
+    oh_logger = logging.getLogger("processor.overhead")
+    oh_logger.setLevel(logging.DEBUG)
+    oh_logger.propagate = False  # don't double-emit to the root Dynamo logger
+
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=50 * 1024 * 1024,  # 50 MB per file
+        backupCount=5,
+        encoding="utf-8",
+    )
+    # Formatter emits the raw message only — each call passes a pre-built JSON string.
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    oh_logger.addHandler(handler)
+
+    logger.info("Overhead log → %s  (max 5 × 50 MB, JSON Lines format)", log_path)
+    return oh_logger
+
+
 # ----------------------- request / response models ----------------------- #
 class RouterRequest(BaseModel):
     """Request to the Thompson Sampling router."""
@@ -135,8 +169,8 @@ class RouterRequest(BaseModel):
     tokens: list[int]
     prefix_id: str = "<no_reuse>"
     reuse_budget: int = 0  # remaining *after this request*
-    expected_osl: str | None = "MEDIUM"
-    interarrival: str | None = "MEDIUM"
+    expected_osl: int = 250
+    interarrival: int = 250
 
 
 class RouterFeedbackRequest(BaseModel):
@@ -368,13 +402,19 @@ class ProcessorRequestHandler:
         # Prevent fire-and-forget tasks from being garbage-collected
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Metrics (initialized in initialize())
+        # Metrics and overhead logger (initialized in initialize())
         self._metrics: ProcessorMetrics | None = None
+        self._overhead_log: logging.Logger | None = None
 
     async def initialize(self):
         """Initialize processor by setting up metrics and connecting to services."""
         # Initialize metrics using Dynamo's metrics API
         self._metrics = ProcessorMetrics(self.endpoint)
+
+        # Set up dedicated JSON Lines file for overhead / routing timing analysis.
+        # Path can be overridden via PROCESSOR_OVERHEAD_LOG env var.
+        overhead_log_path = os.environ.get("PROCESSOR_OVERHEAD_LOG", "/tmp/processor_overhead.jsonl")
+        self._overhead_log = _setup_overhead_logger(overhead_log_path)
 
         # Connect to Thompson Sampling router
         if self.enable_router:
@@ -455,10 +495,16 @@ class ProcessorRequestHandler:
         if not isinstance(annotations, list):
             annotations = []
 
+        if annotations:
+            logger.debug("Raw annotations: %s", annotations)
+        else:
+            logger.debug("No annotations in request (prefix_id will be auto-generated)")
+
         # Extract prefix_id (generate one if not provided)
         prefix_id = self._extract_annotation(annotations, "prefix_id")
         if not prefix_id:
             prefix_id = f"auto-{uuid.uuid4().hex}"
+            logger.debug("No prefix_id in annotations, generated: %s", prefix_id)
 
         # Extract total_requests count
         total_str = self._extract_annotation(annotations, "total_requests", "1")
@@ -467,17 +513,24 @@ class ProcessorRequestHandler:
         except (ValueError, TypeError):
             total_requests = 1
 
-        # Extract expected output sequence length.
-        # Accepts categorical strings (LOW/MEDIUM/HIGH) or raw token counts.
-        # Raw thresholds match dynamo_llm.py: <256→LOW, <1024→MEDIUM, ≥1024→HIGH.
-        osl = self._extract_annotation(annotations, "osl", "MEDIUM")
-        osl = self._to_category(osl, thresholds=(256, 1024), default="MEDIUM")
+        # Extract expected output sequence length as a raw integer.
+        # Accepts categorical strings (LOW→128, MEDIUM→250, HIGH→1024) or raw integers.
+        # Passed directly to the router so LinTS features receive continuous values.
+        _OSL_CAT = {"LOW": 128, "MEDIUM": 250, "HIGH": 1024}
+        osl_raw = self._extract_annotation(annotations, "osl", "MEDIUM")
+        try:
+            osl: int = int(osl_raw)
+        except (ValueError, TypeError):
+            osl = _OSL_CAT.get(str(osl_raw).upper(), 250)
 
-        # Extract interarrival time.
-        # Accepts categorical strings (LOW/MEDIUM/HIGH) or raw millisecond values.
-        # Raw thresholds match dynamo_llm.py: <100→LOW, <500→MEDIUM, ≥500→HIGH.
-        iat = self._extract_annotation(annotations, "iat", "MEDIUM")
-        iat = self._to_category(iat, thresholds=(100, 500), default="MEDIUM")
+        # Extract interarrival time as a raw integer (milliseconds).
+        # Accepts categorical strings (LOW→50, MEDIUM→250, HIGH→1000) or raw ms values.
+        _IAT_CAT = {"LOW": 50, "MEDIUM": 250, "HIGH": 1000}
+        iat_raw = self._extract_annotation(annotations, "iat", "MEDIUM")
+        try:
+            iat: int = int(iat_raw)
+        except (ValueError, TypeError):
+            iat = _IAT_CAT.get(str(iat_raw).upper(), 250)
 
         return prefix_id, total_requests, osl, iat
 
@@ -511,8 +564,8 @@ class ProcessorRequestHandler:
         token_ids: list[int],
         prefix_id: str,
         reuse_budget: int,
-        osl: str,
-        iat: str,
+        osl: int,
+        iat: int,
     ) -> tuple[int | None, str | None]:
         """
         Pick a worker via the Thompson Sampling router.
@@ -531,6 +584,7 @@ class ProcessorRequestHandler:
         )
 
         try:
+            t_nats_start = time.perf_counter()
             stream = await self.router_pick_client.generate(req.model_dump())
 
             worker_id: int | None = None
@@ -551,11 +605,20 @@ class ProcessorRequestHandler:
                 decision_id = data.get("decision_id")
                 break
 
+            nats_rtt_ms = (time.perf_counter() - t_nats_start) * 1000.0
+
             # Record routing decision
             if worker_id is not None:
                 self._metrics.routing_decisions_total.labels(worker_id=str(worker_id)).inc()
+                logger.info(
+                    "nats_overhead: prefix=%s worker=%s nats_rtt_ms=%.1f",
+                    prefix_id, worker_id, nats_rtt_ms,
+                )
             else:
-                logger.warning("Router stream ended without worker_id; falling back to engine load balancing.")
+                logger.warning(
+                    "nats_overhead: prefix=%s nats_rtt_ms=%.1f (no worker returned, fallback)",
+                    prefix_id, nats_rtt_ms,
+                )
 
             return worker_id, decision_id
 
@@ -749,6 +812,7 @@ class ProcessorRequestHandler:
         try:
             # Increment request counter
             self._metrics.requests_total.inc()
+            t_proc_start = time.perf_counter()
 
             # Extract routing hints from annotations
             prefix_id, total_requests, osl, iat = self._extract_hints(raw)
@@ -759,27 +823,61 @@ class ProcessorRequestHandler:
                 token_ids = []
 
             tokens_in = len(token_ids)
-            logger.info(
-                "Processing request: prefix=%s total=%d osl=%s iat=%s tokens=%d",
-                prefix_id,
-                total_requests,
-                osl,
-                iat,
-                tokens_in,
-            )
+            is_auto = prefix_id.startswith("auto-")
 
             # Compute reuse_budget := remaining AFTER this request
             reuse_budget = await self._update_prefix_state(prefix_id, total_requests)
 
-            # Pick worker via Thompson Sampling router
+            logger.info(
+                "Processing request: prefix=%s total=%d reuse_budget=%d osl=%s iat=%s "
+                "tokens=%d source=%s",
+                prefix_id,
+                total_requests,
+                reuse_budget,
+                osl,
+                iat,
+                tokens_in,
+                "auto" if is_auto else "annotation",
+            )
+
+            # Pick worker via Thompson Sampling router (includes NATS RPC)
+            t_routing_start = time.perf_counter()
             worker_id, decision_id = await self._pick_worker(token_ids, prefix_id, reuse_budget, osl, iat)
+            routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
+
+            # Total processor overhead up to this point (hint extraction + prefix state + routing)
+            proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
 
             logger.info(
-                "Routing decision: worker=%s decision=%s reuse_budget=%d",
+                "Routing decision: prefix=%s worker=%s decision=%s reuse_budget=%d "
+                "routing_ms=%.1f proc_overhead_ms=%.1f",
+                prefix_id,
                 worker_id,
                 decision_id,
                 reuse_budget,
+                routing_ms,
+                proc_overhead_ms,
             )
+
+            # Write structured record to the JSON Lines overhead log.
+            # Append additional fields here as needed for future analysis.
+            if self._overhead_log is not None:
+                record = {
+                    "ts": time.time(),
+                    "prefix_id": prefix_id,
+                    "worker_id": worker_id,
+                    "decision_id": decision_id,
+                    "tokens_in": tokens_in,
+                    "osl": osl,
+                    "iat": iat,
+                    "reuse_budget": reuse_budget,
+                    "is_auto": is_auto,
+                    # Timing breakdown (all in milliseconds)
+                    "nats_rtt_ms": round(routing_ms, 2),        # NATS round-trip to router
+                    "proc_overhead_ms": round(proc_overhead_ms, 2),  # total pre-engine overhead
+                    "routing_routed": worker_id is not None,
+                }
+                self._overhead_log.info(json.dumps(record))
 
             # Stream response from engine
             async for resp in self._stream_from_engine(raw, worker_id, decision_id, tokens_in):

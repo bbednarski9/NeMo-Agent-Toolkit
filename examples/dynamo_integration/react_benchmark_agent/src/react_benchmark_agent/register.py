@@ -21,6 +21,12 @@ from .react_benchmark_agent import react_benchmark_agent_function
 # Import banking tools group
 from .banking_tools import banking_tools_group_function
 
+# Import domain tools groups (healthcare, insurance, investment, telecom)
+from .domain_tools import healthcare_tools_group_function
+from .domain_tools import insurance_tools_group_function
+from .domain_tools import investment_tools_group_function
+from .domain_tools import telecom_tools_group_function
+
 # Import self-evaluating agent wrappers (both modes from unified module)
 # - self_evaluating_agent: Legacy mode, no feedback by default
 # - self_evaluating_agent_with_feedback: Advanced mode with feedback

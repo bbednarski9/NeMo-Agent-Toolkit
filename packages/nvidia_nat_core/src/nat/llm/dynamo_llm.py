@@ -637,6 +637,22 @@ class _DynamoTransport(httpx.AsyncBaseTransport):
                         existing = {}
                     body["nvext"]["agent_hints"] = {**existing, **agent_hints}
 
+                    # Mirror all agent_hints into nvext.annotations as
+                    # "key:value" strings. The Dynamo frontend's Rust
+                    # AgentHints struct only deserializes a subset of
+                    # fields (osl, priority, latency_sensitivity) and
+                    # silently drops the rest. Annotations pass through
+                    # untouched, so the processor can read any hint via
+                    # _extract_annotation(key). When Dynamo adds native
+                    # support for these fields in AgentHints, both paths
+                    # will carry the same data.
+                    annotations = body["nvext"].get("annotations", [])
+                    if not isinstance(annotations, list):
+                        annotations = []
+                    for k, v in agent_hints.items():
+                        annotations.append(f"{k}:{v}")
+                    body["nvext"]["annotations"] = annotations
+
                     # Commit the per-prefix counter now that the request is
                     # confirmed eligible for injection.
                     with self._call_counts_lock:

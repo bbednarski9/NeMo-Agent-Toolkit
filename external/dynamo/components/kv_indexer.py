@@ -56,9 +56,20 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import threading
 from typing import Any
+
+import zmq
+import zmq.asyncio
+
+try:
+    import msgpack
+    _HAS_MSGPACK = True
+except ImportError:
+    _HAS_MSGPACK = False
 
 logger = logging.getLogger(__name__)
 
@@ -92,18 +103,38 @@ except ImportError as exc:
 # OverlapScores wrapper
 # ---------------------------------------------------------------------------
 class OverlapScores:
-    """Normalised overlap scores compatible with the router's interface.
+    """Overlap scores compatible with the router's interface.
 
-    The router accesses ``scores.scores.get(worker_id, 0.0)`` and expects
-    a ``float`` in [0, 1] representing the fraction of the request's KV
-    blocks that are already cached on a given worker.
+    Attributes
+    ----------
+    scores : dict[int, float]
+        Worker ID → fraction of the request's KV blocks cached on that
+        worker (float in [0, 1]).  Used by ``kv_only``, ``kv_load_balanced``,
+        ``kv_thompson``, and the full Thompson mode.
+    raw_block_counts : dict[int, int]
+        Worker ID → absolute number of matching prefix blocks.  Used by
+        ``kv_load`` to replicate the native Dynamo formula.
+    tree_sizes : dict[int, int]
+        Worker ID → total number of blocks in the router's radix tree for
+        that worker.  Used as a tiebreaker in ``kv_load``.
+    total_blocks : int
+        Total number of blocks in the request's token sequence.
     """
 
-    def __init__(self, scores: dict[int, float] | None = None):
+    def __init__(
+        self,
+        scores: dict[int, float] | None = None,
+        raw_block_counts: dict[int, int] | None = None,
+        tree_sizes: dict[int, int] | None = None,
+        total_blocks: int = 0,
+    ):
         self.scores: dict[int, float] = scores if scores is not None else {}
+        self.raw_block_counts: dict[int, int] = raw_block_counts if raw_block_counts is not None else {}
+        self.tree_sizes: dict[int, int] = tree_sizes if tree_sizes is not None else {}
+        self.total_blocks: int = total_blocks
 
     def __repr__(self) -> str:
-        return f"OverlapScores({self.scores})"
+        return f"OverlapScores(scores={self.scores}, raw_block_counts={self.raw_block_counts})"
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +164,15 @@ class KvIndexer:
         self.block_size = block_size
         self._listeners: dict[int, Any] = {}  # worker_id -> ZmqKvEventListener
         self._radix_tree: Any | None = None
+        self._tree_lock = threading.Lock()
         self._poll_task: asyncio.Task | None = None  # background drain loop
+        self._event_counter: int = 0
+
+        # vLLM-native ZMQ subscribers (raw zmq + msgpack, bypasses dynamo.llm)
+        self._vllm_sockets: dict[int, zmq.asyncio.Socket] = {}
+        self._vllm_ctx: zmq.asyncio.Context | None = None
+        self._vllm_drain_task: asyncio.Task | None = None
+        self._vllm_events_applied: int = 0
 
         if _HAS_DYNAMO_KV:
             self._radix_tree = _RadixTree()
@@ -232,16 +271,140 @@ class KvIndexer:
                 logger.exception("KvIndexer: failed to get events from worker %s", worker_id)
                 continue
 
-            for event_json in events:
-                try:
-                    self._radix_tree.apply_event(worker_id, event_json.encode("utf-8"))
-                    total += 1
-                except Exception:
-                    logger.exception(
-                        "KvIndexer: failed to apply event from worker %s",
-                        worker_id,
-                    )
+            with self._tree_lock:
+                for event_json in events:
+                    try:
+                        self._radix_tree.apply_event(worker_id, event_json.encode("utf-8"))
+                        total += 1
+                    except Exception:
+                        logger.exception(
+                            "KvIndexer: failed to apply event from worker %s",
+                            worker_id,
+                        )
         return total
+
+    # ------------------------------------------------------------------
+    # vLLM-native ZMQ event drain (msgpack multipart protocol)
+    # ------------------------------------------------------------------
+
+    def add_vllm_worker(self, worker_id: int, zmq_endpoint: str) -> None:
+        """Subscribe to a vLLM worker's ZMQ KV event stream.
+
+        vLLM publishes msgpack multipart messages: [topic, seq, payload].
+        Payload is ``[timestamp, events_list, dp_rank]``.
+
+        Event types (list format):
+          - ``['BlockStored', [hashes], parent, token_ids, block_size, lora_id, medium]``
+          - ``['BlockRemoved', [hashes], medium]``
+          - ``['AllBlocksCleared']``
+        """
+        if not _HAS_DYNAMO_KV or not _HAS_MSGPACK:
+            if not _HAS_MSGPACK:
+                logger.warning("msgpack not available; cannot subscribe to vLLM KV events")
+            return
+        if worker_id in self._vllm_sockets:
+            return
+        if self._vllm_ctx is None:
+            self._vllm_ctx = zmq.asyncio.Context()
+        sock = self._vllm_ctx.socket(zmq.SUB)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        sock.connect(zmq_endpoint)
+        self._vllm_sockets[worker_id] = sock
+        logger.info("KvIndexer: subscribed to vLLM worker %s at %s", worker_id, zmq_endpoint)
+
+    def start_vllm_drain(self, interval: float = 0.1) -> None:
+        """Start an asyncio task that drains vLLM ZMQ events."""
+        if self._vllm_drain_task is not None or not self._vllm_sockets:
+            return
+        self._vllm_drain_task = asyncio.create_task(self._vllm_drain_loop(interval))
+        logger.info("KvIndexer: started vLLM event drain (interval=%.2fs, workers=%d)",
+                     interval, len(self._vllm_sockets))
+
+    async def _vllm_drain_loop(self, interval: float) -> None:
+        while True:
+            try:
+                await self._drain_vllm_events()
+            except Exception:
+                logger.exception("KvIndexer: error draining vLLM events")
+            await asyncio.sleep(interval)
+
+    async def _drain_vllm_events(self) -> int:
+        if not _HAS_DYNAMO_KV or self._radix_tree is None:
+            return 0
+
+        total = 0
+        for worker_id, sock in self._vllm_sockets.items():
+            while True:
+                try:
+                    parts = await sock.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+
+                if len(parts) < 3:
+                    continue
+                try:
+                    batch = msgpack.unpackb(parts[2], raw=False, strict_map_key=False)
+                except Exception:
+                    continue
+
+                events = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 3 else []
+                if not isinstance(events, list):
+                    continue
+
+                for evt in events:
+                    applied = self._apply_vllm_event(worker_id, evt)
+                    total += applied
+
+        self._vllm_events_applied += total
+        return total
+
+    def _apply_vllm_event(self, worker_id: int, evt: Any) -> int:
+        """Translate a single vLLM event into a radix tree update.
+
+        Returns 1 if an event was applied, 0 otherwise.
+        """
+        if not isinstance(evt, (list, tuple)) or not evt:
+            return 0
+
+        evt_type = str(evt[0]).lower()
+        self._event_counter += 1
+        eid = self._event_counter
+
+        with self._tree_lock:
+            try:
+                if "stored" in evt_type:
+                    hashes = evt[1] if len(evt) > 1 and isinstance(evt[1], list) else []
+                    if not hashes:
+                        return 0
+                    event = {
+                        "event_id": eid,
+                    "data": {"stored": {"blocks": [
+                        {"block_hash": h, "tokens_hash": h} for h in hashes
+                    ]}},
+                    }
+                    self._radix_tree.apply_event(worker_id, json.dumps(event).encode("utf-8"))
+                    return 1
+
+                elif "removed" in evt_type:
+                    hashes = evt[1] if len(evt) > 1 and isinstance(evt[1], list) else []
+                    if not hashes:
+                        return 0
+                    event = {
+                        "event_id": eid,
+                        "data": {"removed": {"block_hashes": hashes}},
+                    }
+                    self._radix_tree.apply_event(worker_id, json.dumps(event).encode("utf-8"))
+                    return 1
+
+                elif "cleared" in evt_type:
+                    self._radix_tree.clear_all_blocks(worker_id)
+                    return 1
+
+            except Exception:
+                logger.debug("KvIndexer: failed to apply vLLM event type=%s for worker %s",
+                             evt_type, worker_id)
+        return 0
 
     # ------------------------------------------------------------------
     # Overlap query (called by the router)
@@ -250,9 +413,11 @@ class KvIndexer:
     async def find_matches_for_request(self, tokens: list[int], min_overlap: int) -> OverlapScores:
         """Compute per-worker overlap scores for a token sequence.
 
-        Returns an ``OverlapScores`` object whose ``.scores`` dict maps
-        ``worker_id → float`` in [0, 1] representing the fraction of the
-        request's KV blocks already cached on that worker.
+        Returns an ``OverlapScores`` object with:
+        - ``.scores``: ``worker_id → float`` in [0, 1] (fraction of cached blocks)
+        - ``.raw_block_counts``: ``worker_id → int`` (absolute count of matching blocks)
+        - ``.tree_sizes``: ``worker_id → int`` (total blocks in tree for that worker)
+        - ``.total_blocks``: ``int`` (total blocks in this request)
         """
         if not _HAS_DYNAMO_KV or self._radix_tree is None:
             return OverlapScores({})
@@ -268,24 +433,81 @@ class KvIndexer:
 
         total_blocks = len(block_hashes)
 
-        # Query the radix tree
-        raw_scores = self._radix_tree.find_matches(block_hashes)
+        with self._tree_lock:
+            raw_scores = self._radix_tree.find_matches(block_hashes)
 
         # raw_scores.scores is dict[(worker_id, dp_rank), count] from Rust.
-        # Normalise to dict[worker_id, float] for the router.
+        # Produce both normalised fractions and raw block counts.
         normalised: dict[int, float] = {}
+        raw_counts: dict[int, int] = {}
+        tree_sizes: dict[int, int] = {}
         for key, count in raw_scores.scores.items():
-            # Handle both (worker_id, dp_rank) tuple keys and plain int keys
             if isinstance(key, tuple):
                 wid = int(key[0])
             else:
                 wid = int(key)
             frac = float(count) / float(total_blocks)
-            # Keep the best score if a worker appears with multiple dp_ranks
             if frac > normalised.get(wid, 0.0):
                 normalised[wid] = frac
+                raw_counts[wid] = int(count)
 
-        return OverlapScores(normalised)
+        # Extract tree sizes if the Rust OverlapScores exposes them
+        if hasattr(raw_scores, "tree_sizes"):
+            for key, size in raw_scores.tree_sizes.items():
+                if isinstance(key, tuple):
+                    wid = int(key[0])
+                else:
+                    wid = int(key)
+                if size > tree_sizes.get(wid, 0):
+                    tree_sizes[wid] = int(size)
+
+        logger.debug(
+            "find_matches: total_blocks=%d raw_keys=%d normalised=%s raw_counts=%s",
+            total_blocks,
+            len(raw_scores.scores),
+            {str(k): f"{v:.4f}" for k, v in normalised.items()},
+            raw_counts,
+        )
+
+        return OverlapScores(normalised, raw_counts, tree_sizes, total_blocks)
+
+    # ------------------------------------------------------------------
+    # Local radix tree updates (predict-from-routing-decisions mode)
+    # ------------------------------------------------------------------
+
+    def record_routing_decision(self, worker_id: int, tokens: list[int]) -> None:
+        """Record that *tokens* were sent to *worker_id*.
+
+        Synthesises a ``stored`` KV event and applies it to the local radix
+        tree.  This keeps the tree up-to-date based on routing decisions
+        alone -- the same strategy used by Dynamo's built-in KV-aware
+        frontend router (``--no-kv-events`` mode).
+        """
+        if not _HAS_DYNAMO_KV or self._radix_tree is None:
+            return
+
+        block_hashes = _compute_block_hash_for_seq(tokens, self.block_size)
+        if not block_hashes:
+            return
+
+        self._event_counter += 1
+        event = {
+            "event_id": self._event_counter,
+            "data": {
+                "stored": {
+                    "blocks": [
+                        {"block_hash": h, "tokens_hash": h}
+                        for h in block_hashes
+                    ],
+                },
+            },
+        }
+
+        with self._tree_lock:
+            try:
+                self._radix_tree.apply_event(worker_id, json.dumps(event).encode("utf-8"))
+            except Exception:
+                logger.debug("record_routing_decision: apply_event failed for worker %s", worker_id)
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -296,4 +518,13 @@ class KvIndexer:
         if self._poll_task is not None:
             self._poll_task.cancel()
             self._poll_task = None
-            logger.info("KvIndexer: background drain stopped")
+        if self._vllm_drain_task is not None:
+            self._vllm_drain_task.cancel()
+            self._vllm_drain_task = None
+        for sock in self._vllm_sockets.values():
+            sock.close()
+        self._vllm_sockets.clear()
+        if self._vllm_ctx is not None:
+            self._vllm_ctx.term()
+            self._vllm_ctx = None
+        logger.info("KvIndexer: shutdown complete (vllm_events_applied=%d)", self._vllm_events_applied)

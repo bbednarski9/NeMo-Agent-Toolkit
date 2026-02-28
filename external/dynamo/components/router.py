@@ -346,6 +346,34 @@ def _init_prometheus_metrics():
                 buckets=[32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
                 registry=REGISTRY,
             )
+            metrics["decisions_by_domain"] = Counter(
+                "thompson_router_decisions_by_domain_total",
+                "Routing decisions by worker and domain",
+                ["worker_id", "domain"],
+                registry=REGISTRY,
+            )
+            # KV opportunity-cost metrics: measure the trade-off between KV
+            # cache hit rate and worker load at each routing decision.
+            metrics["kv_vs_idle_delta"] = Histogram(
+                "thompson_router_kv_vs_idle_delta",
+                "KV overlap delta: chosen_overlap - best_idle_overlap.  "
+                "Positive = routed to a better KV match but busier worker.  "
+                "Negative = routed to idle worker with worse KV coverage.",
+                buckets=[-1.0, -0.5, -0.2, -0.1, 0.0, 0.1, 0.2, 0.5, 1.0],
+                registry=REGISTRY,
+            )
+            metrics["routed_to_queued"] = Counter(
+                "thompson_router_routed_to_queued_total",
+                "Decisions where chosen worker had queue depth > 0 and an idle alternative existed",
+                registry=REGISTRY,
+            )
+            metrics["idle_kv_miss"] = Histogram(
+                "thompson_router_idle_kv_miss",
+                "KV overlap of the BEST IDLE worker at routing time "
+                "(shows what KV coverage would be if we always routed to the lowest-queue worker).",
+                buckets=[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0],
+                registry=REGISTRY,
+            )
             logger.info("Prometheus metrics initialized for router")
         except ImportError:
             logger.warning("prometheus_client not available, metrics disabled")
@@ -448,6 +476,34 @@ class WorkloadAwareRouter:
         timeout_reward: float = 0.0,
         # ---------- Latency EMA (reward normalization) ----------
         latency_ema_alpha: float = 0.2,
+        # ---------- kv_load (Dynamo-native formula) ----------
+        kv_load_overlap_weight: float = 1.0,
+        kv_load_temperature: float = 0.0,
+        metrics_scrape_interval: float = 0.1,
+        # ---------- kv_load_balanced / kv_thompson ----------
+        idle_boost: float = 0.1,
+        kv_load_temp: float = 0.5,
+        kv_ts_weight: float = 0.05,
+        kv_thompson_queue_penalty_weight: float | None = None,
+        kv_thompson_cold_start: float = 0.05,
+        # ---------- kv_thompson feature toggles ----------
+        kt_enable_lints: bool = False,
+        kt_enable_affinity: bool = False,
+        kt_enable_switching_cost: bool = False,
+        kt_enable_full_load: bool = False,
+        kt_enable_adaptive_temp: bool = False,
+        kt_enable_adaptive_explore: bool = False,
+        kt_enable_sticky_floor: bool = False,
+        kt_lints_weight: float = 1.0,
+        kt_affinity_base: float = 0.30,
+        kt_affinity_reuse_weight: float = 0.08,
+        kt_affinity_iat_weight: float = 0.20,
+        kt_switch_base: float = 0.10,
+        kt_switch_reuse: float = 0.04,
+        kt_switch_iat: float = 0.03,
+        kt_sticky_load_floor: float = 0.01,
+        kt_load_mod_floor: float = 0.0,
+        kt_adaptive_temp_base: float = 1.0,
         # ---------- Debug traces ----------
         debug_traces: bool = False,
         debug_trace_dir: str = "/tmp/dynamo_router_traces",
@@ -527,6 +583,46 @@ class WorkloadAwareRouter:
 
         # Pending decisions waiting for feedback
         self.pending: dict[str, dict[str, Any]] = {}
+
+        # Cold-start round-robin counter for kv_only / kv_load_balanced modes
+        self._cold_start_rr: int = 0
+
+        # kv_load (Dynamo-native) parameters
+        self.kv_load_overlap_weight = float(kv_load_overlap_weight)
+        self.kv_load_temperature = float(kv_load_temperature)
+        self.metrics_scrape_interval = float(metrics_scrape_interval)
+
+        # kv_load: per-worker routing counter — mirrors Dynamo's
+        # ActiveSequences.  Incremented on each routing decision so the
+        # next decision sees the load we just created.
+        self._kv_load_routed: dict[int, int] = {}  # worker_id -> cumulative routes
+        self._kv_load_routed_lock = threading.Lock()
+
+        # kv_load_balanced / kv_thompson mode parameters
+        self.idle_boost = float(idle_boost)
+        self.kv_load_temp = float(kv_load_temp)
+        self.kv_ts_weight = float(kv_ts_weight)
+        self.kv_thompson_queue_pw = kv_thompson_queue_penalty_weight
+        self.kv_thompson_cold_start = float(kv_thompson_cold_start)
+
+        # kv_thompson feature toggles
+        self.kt_enable_lints = bool(kt_enable_lints)
+        self.kt_enable_affinity = bool(kt_enable_affinity)
+        self.kt_enable_switching_cost = bool(kt_enable_switching_cost)
+        self.kt_enable_full_load = bool(kt_enable_full_load)
+        self.kt_enable_adaptive_temp = bool(kt_enable_adaptive_temp)
+        self.kt_enable_adaptive_explore = bool(kt_enable_adaptive_explore)
+        self.kt_enable_sticky_floor = bool(kt_enable_sticky_floor)
+        self.kt_lints_weight = float(kt_lints_weight)
+        self.kt_affinity_base = float(kt_affinity_base)
+        self.kt_affinity_reuse_weight = float(kt_affinity_reuse_weight)
+        self.kt_affinity_iat_weight = float(kt_affinity_iat_weight)
+        self.kt_switch_base = float(kt_switch_base)
+        self.kt_switch_reuse = float(kt_switch_reuse)
+        self.kt_switch_iat = float(kt_switch_iat)
+        self.kt_sticky_load_floor = float(kt_sticky_load_floor)
+        self.kt_load_mod_floor = float(kt_load_mod_floor)
+        self.kt_adaptive_temp_base = float(kt_adaptive_temp_base)
 
         # Debug traces
         self.debug_traces = bool(debug_traces)
@@ -633,26 +729,42 @@ class WorkloadAwareRouter:
 
         # Start background metrics scraper (non-blocking HTTP scrapes in a daemon thread).
         discovered_worker_ids = sorted(int(w) for w in self.engine_client.instance_ids())
-        self._start_metrics_scraper(discovered_worker_ids, interval=1.0)
+        self._start_metrics_scraper(discovered_worker_ids, interval=self.metrics_scrape_interval)
 
         # Register workers' ZMQ KV event streams for overlap scoring.
         # Port allocation: KV_EVENT_BASE_PORT + worker_index (sorted by instance_id).
         kv_event_base_port = int(os.environ.get("KV_EVENT_BASE_PORT", "0"))
         enable_kv_events = os.environ.get("ENABLE_KV_EVENTS", "false").lower() == "true"
+        is_vllm = worker_component == "backend"
         if enable_kv_events and kv_event_base_port > 0:
             discovered_ids = sorted(int(w) for w in self.engine_client.instance_ids())
-            for idx, wid in enumerate(discovered_ids):
-                endpoint = f"tcp://127.0.0.1:{kv_event_base_port + idx}"
-                self.indexer.add_worker(wid, endpoint)
-            self.indexer.start_background_drain(interval=0.25)
-            logger.info(
-                "KvIndexer: %d workers registered, background drain started (base_port=%d)",
-                len(discovered_ids),
-                kv_event_base_port,
-            )
+            if is_vllm:
+                # vLLM publishes msgpack multipart events on raw ZMQ; use the
+                # native vLLM drain which handles stored + removed + cleared.
+                for idx, wid in enumerate(discovered_ids):
+                    endpoint = f"tcp://127.0.0.1:{kv_event_base_port + idx}"
+                    self.indexer.add_vllm_worker(wid, endpoint)
+                self.indexer.start_vllm_drain(interval=0.1)
+                logger.info(
+                    "KvIndexer: %d vLLM workers registered, event drain started (base_port=%d)",
+                    len(discovered_ids),
+                    kv_event_base_port,
+                )
+            else:
+                # SGLang uses Dynamo's ZmqKvEventListener (JSON protocol).
+                for idx, wid in enumerate(discovered_ids):
+                    endpoint = f"tcp://127.0.0.1:{kv_event_base_port + idx}"
+                    self.indexer.add_worker(wid, endpoint)
+                self.indexer.start_background_drain(interval=0.25)
+                logger.info(
+                    "KvIndexer: %d SGLang workers registered, background drain started (base_port=%d)",
+                    len(discovered_ids),
+                    kv_event_base_port,
+                )
         else:
             logger.info(
-                "KvIndexer: KV event overlap disabled (ENABLE_KV_EVENTS=%s, KV_EVENT_BASE_PORT=%s)",
+                "KvIndexer: KV event drain disabled (ENABLE_KV_EVENTS=%s, KV_EVENT_BASE_PORT=%s); "
+                "using record_routing_decision() for radix tree updates",
                 os.environ.get("ENABLE_KV_EVENTS", "unset"),
                 os.environ.get("KV_EVENT_BASE_PORT", "unset"),
             )
@@ -661,6 +773,34 @@ class WorkloadAwareRouter:
         self._initialize_contextual()
         logger.info("WorkloadAwareRouter initialized with %d backend worker(s)",
                     len(list(self.engine_client.instance_ids())))
+
+        if self.router_type == "kv_thompson":
+            qpw = self.kv_thompson_queue_pw if self.kv_thompson_queue_pw is not None else self.queue_penalty_weight
+            logger.info(
+                "kv_thompson config: ts_weight=%.4f idle_boost=%.4f temperature=%.4f "
+                "queue_penalty_weight=%.4f cold_start_threshold=%.4f metrics_scrape_interval=%.3f",
+                self.kv_ts_weight, self.idle_boost, self.kv_load_temp,
+                qpw, self.kv_thompson_cold_start, self.metrics_scrape_interval,
+            )
+            features = []
+            if self.kt_enable_lints:
+                features.append(f"lints(w={self.kt_lints_weight:.2f})")
+            if self.kt_enable_affinity:
+                features.append(f"affinity(base={self.kt_affinity_base:.2f} reuse={self.kt_affinity_reuse_weight:.2f})")
+            if self.kt_enable_switching_cost:
+                features.append(f"switch_cost(base={self.kt_switch_base:.2f} reuse={self.kt_switch_reuse:.2f})")
+            if self.kt_enable_full_load:
+                features.append("full_load(gpu+queue+outstanding+coupling)")
+            if self.kt_enable_adaptive_temp:
+                features.append(f"adaptive_temp(base={self.kt_adaptive_temp_base:.2f})")
+            if self.kt_enable_adaptive_explore:
+                features.append("adaptive_explore")
+            if self.kt_enable_sticky_floor:
+                features.append(f"sticky_floor({self.kt_sticky_load_floor:.3f})")
+            if features:
+                logger.info("kv_thompson features ON: %s", " | ".join(features))
+            else:
+                logger.info("kv_thompson features: all optional features OFF (base mode)")
 
     @safe_update("_init_lock")
     def _initialize_bandits(self):
@@ -705,13 +845,18 @@ class WorkloadAwareRouter:
         decode_cost: float,
         prefill_cost: float,
         iat_factor: float,
+        consecutive: int = 1,
     ):
         """Record/refresh prefix assignment."""
         if reuse_remaining <= 0:
             self.prefix_cache_state.pop(pid, None)
             self.prefix_meta.pop(pid, None)
         else:
-            self.prefix_cache_state[pid] = {"worker": wid, "reuse_remaining": max(0, int(reuse_remaining))}
+            self.prefix_cache_state[pid] = {
+                "worker": wid,
+                "reuse_remaining": max(0, int(reuse_remaining)),
+                "consecutive": int(consecutive),
+            }
             self.prefix_meta[pid] = {
                 "decode_cost": float(decode_cost),
                 "prefill_cost": float(max(prefill_cost, 0.0)),
@@ -741,13 +886,26 @@ class WorkloadAwareRouter:
     # Each canonical metric maps to the exact line prefix(es) for SGLang and vLLM.
     # Using startswith() avoids substring collisions (e.g. pending_prealloc_token_usage).
     _METRIC_PREFIXES: dict[str, list[str]] = {
-        "gpu_cache_usage": [
-            "sglang:token_usage{",  # SGLang: KV cache fraction (0-1)
-            "vllm:kv_cache_usage_perc{",  # vLLM: same semantic, different name
+        "locked_kv_cache": [
+            "sglang:token_usage{",  # SGLang: locked (non-evictable) KV cache fraction (0-1)
+            "vllm:kv_cache_usage_perc{",  # vLLM: same semantic — only ref_cnt>0 blocks
         ],
         "queue_depth": [
             "sglang:num_queue_reqs{",  # SGLang: scheduler queue depth
             "vllm:num_requests_waiting{",  # vLLM: same semantic
+        ],
+        "num_used_tokens": [
+            "sglang:num_used_tokens{",  # SGLang: locked tokens (total - available - evictable)
+        ],
+        "max_total_num_tokens": [
+            "sglang:max_total_num_tokens{",  # SGLang: total KV cache capacity in tokens
+        ],
+        "active_seq_tokens": [
+            "sglang:decode_sum_seq_lens{",  # SGLang: sum of sequence lengths of running batch
+        ],
+        "num_running_reqs": [
+            "sglang:num_running_reqs{",  # SGLang: running batch size
+            "vllm:num_requests_running{",  # vLLM: same semantic
         ],
     }
 
@@ -763,7 +921,7 @@ class WorkloadAwareRouter:
         if hasattr(self, "_scraper_running") and self._scraper_running:
             return
 
-        self._scraped_metrics: dict[int, dict[str, float]] = {}  # wid -> {gpu, queue}
+        self._scraped_metrics: dict[int, dict[str, float]] = {}
         self._scraper_running = True
         self._scraper_worker_ids = sorted(worker_ids)
         self._scraper_base_port = int(os.environ.get("WORKER_METRICS_PORT", "0"))
@@ -775,25 +933,28 @@ class WorkloadAwareRouter:
                     if self._scraper_base_port <= 0:
                         break
                     port = self._scraper_base_port + idx
-                    gpu = 0.0
-                    queue = 0.0
+                    scraped: dict[str, float] = {
+                        "locked_kv_cache": 0.0,
+                        "queue_depth": 0.0,
+                        "num_used_tokens": 0.0,
+                        "max_total_num_tokens": 0.0,
+                        "active_seq_tokens": 0.0,
+                        "num_running_reqs": 0.0,
+                    }
                     try:
                         resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=1.0)
                         body = resp.read().decode("utf-8", errors="replace")
                         for line in body.splitlines():
                             if line.startswith("#"):
                                 continue
-                            for prefix in self._METRIC_PREFIXES["gpu_cache_usage"]:
-                                if line.startswith(prefix):
-                                    gpu = float(line.rsplit(" ", 1)[-1])
-                                    break
-                            for prefix in self._METRIC_PREFIXES["queue_depth"]:
-                                if line.startswith(prefix):
-                                    queue = float(line.rsplit(" ", 1)[-1])
-                                    break
+                            for key, prefixes in self._METRIC_PREFIXES.items():
+                                for prefix in prefixes:
+                                    if line.startswith(prefix):
+                                        scraped[key] = float(line.rsplit(" ", 1)[-1])
+                                        break
                     except Exception:
                         pass
-                    self._scraped_metrics[wid] = {"gpu": gpu, "queue": queue}
+                    self._scraped_metrics[wid] = scraped
                 time.sleep(interval)
 
         t = threading.Thread(target=_scrape_loop, daemon=True, name="metrics-scraper")
@@ -822,20 +983,31 @@ class WorkloadAwareRouter:
             cached = getattr(self, "_scraped_metrics", {}).get(wid)
 
             if cached:
-                gpu_usage = cached["gpu"]
-                queue_depth = cached["queue"]
+                locked_kv = cached.get("locked_kv_cache", 0.0)
+                queue_depth = cached.get("queue_depth", 0.0)
+                num_used_tokens = cached.get("num_used_tokens", 0.0)
+                max_total_tokens = cached.get("max_total_num_tokens", 0.0)
+                active_seq_tokens = cached.get("active_seq_tokens", 0.0)
+                num_running_reqs = cached.get("num_running_reqs", 0.0)
             else:
-                # Fallback before first scrape completes
-                gpu_usage = min(1.0, pending / 20.0)
+                locked_kv = min(1.0, pending / 20.0)
                 queue_depth = pending
+                num_used_tokens = 0.0
+                max_total_tokens = 0.0
+                active_seq_tokens = 0.0
+                num_running_reqs = pending
 
-            # Blend: use max of scraped queue and pending count
             effective_queue = max(queue_depth, pending)
+            effective_running = max(num_running_reqs, pending)
 
             endpoints.append({
                 "worker_id": wid,
                 "num_requests_waiting": effective_queue,
-                "gpu_cache_usage_perc": gpu_usage,
+                "locked_kv_cache_perc": locked_kv,
+                "num_used_tokens": num_used_tokens,
+                "max_total_num_tokens": max_total_tokens,
+                "active_seq_tokens": active_seq_tokens,
+                "num_running_reqs": effective_running,
             })
 
         return {"endpoints": endpoints}
@@ -933,15 +1105,15 @@ class WorkloadAwareRouter:
         prefill_cost: float,
         iat_factor: float,
     ) -> np.ndarray:
-        gpu = 0.0
+        locked_kv = 0.0
         queue = 0.0
         if metrics and isinstance(metrics, dict) and "endpoints" in metrics:
             for ep in metrics["endpoints"]:
                 if ep.get("worker_id") == wid:
-                    gpu = float(ep.get("gpu_cache_usage_perc", 0.0))
+                    locked_kv = float(ep.get("locked_kv_cache_perc", 0.0))
                     queue = float(ep.get("num_requests_waiting", 0.0))
                     break
-        inv_load = 1.0 / (1.0 + self.gpu_penalty_weight * max(0.0, gpu) + self.queue_penalty_weight * max(0.0, queue))
+        inv_load = 1.0 / (1.0 + self.gpu_penalty_weight * max(0.0, locked_kv) + self.queue_penalty_weight * max(0.0, queue))
 
         overlap = float(scores.scores.get(wid, 0.0))
         affinity = 1.0 if (last_w is not None and wid == last_w) else 0.0
@@ -967,18 +1139,18 @@ class WorkloadAwareRouter:
                         dtype=np.float64)
 
     def _load_score(self, wid: int, metrics: dict[str, Any] | None, job_cost_total: float) -> float:
-        gpu = 0.0
+        locked_kv = 0.0
         queue = 0.0
         if metrics and isinstance(metrics, dict) and "endpoints" in metrics:
             for ep in metrics["endpoints"]:
                 if ep.get("worker_id") == wid:
-                    gpu = float(ep.get("gpu_cache_usage_perc", 0.0))
+                    locked_kv = float(ep.get("locked_kv_cache_perc", 0.0))
                     queue = float(ep.get("num_requests_waiting", 0.0))
                     break
         _, work_out = self._worker_outstanding(wid)
-        penalty = (self.gpu_penalty_weight * gpu + self.queue_penalty_weight * queue +
+        penalty = (self.gpu_penalty_weight * locked_kv + self.queue_penalty_weight * queue +
                    self.outstanding_work_weight * max(0.0, work_out) +
-                   self.job_gpu_coupling_weight * job_cost_total * gpu +
+                   self.job_gpu_coupling_weight * job_cost_total * locked_kv +
                    self.job_queue_coupling_weight * job_cost_total * queue)
         return 1.0 / (1.0 + max(0.0, penalty))
 
@@ -1006,6 +1178,343 @@ class WorkloadAwareRouter:
         reuse_after = max(int(req.reuse_budget), 0)
         decode_cost = self._decode_cost(osl)
         iat_factor = self._iat_factor(iat)
+
+        # ---- kv_only: route purely on KV overlap scores ---- #
+        if self.router_type == "kv_only":
+            worker_list = [int(w) for w in worker_ids]
+            raw_scores: list[float] = []
+            per_worker_ctx: dict[int, dict[str, float]] = {}
+            all_overlaps: dict[int, float] = {}
+            for wid in worker_list:
+                overlap = float(scores.scores.get(wid, 0.0))
+                prefill_cost = self._prefill_cost_for_worker(req.tokens, overlap)
+                raw_scores.append(overlap)
+                all_overlaps[wid] = overlap
+                per_worker_ctx[wid] = {
+                    "decode_cost": decode_cost,
+                    "prefill_cost": prefill_cost,
+                    "iat_factor": iat_factor,
+                    "overlap": overlap,
+                    "reuse_after": float(reuse_after),
+                    "load_mod": 1.0,
+                }
+
+            best = max(raw_scores) if raw_scores else 0.0
+
+            # Ignore trivially small overlaps (shared BOS/template noise).
+            # If best overlap is below ~5% the match is not meaningful domain
+            # affinity -- use round-robin to guarantee every worker gets seeded
+            # before any worker gets a second cold-start assignment.
+            min_meaningful_overlap = 0.05
+            if best < min_meaningful_overlap:
+                candidates = list(range(len(worker_list)))
+                idx = self._cold_start_rr % len(worker_list)
+                self._cold_start_rr += 1
+            else:
+                candidates = [i for i, s in enumerate(raw_scores) if s >= best - 1e-6]
+                idx = random.choice(candidates)
+            chosen = int(worker_list[idx])
+
+            probs = [0.0] * len(worker_list)
+            for c in candidates:
+                probs[c] = 1.0 / len(candidates)
+
+            overlap_str = " ".join(f"w{wid}={v:.3f}" for wid, v in sorted(all_overlaps.items()))
+            logger.info(
+                "kv_only: prefix=%s chosen=%s candidates=%d/%d best=%.4f overlaps=[%s]",
+                req.prefix_id, chosen, len(candidates), len(worker_list), best, overlap_str,
+            )
+
+            return chosen, per_worker_ctx[chosen], per_worker_ctx, raw_scores, probs
+
+        # ---- kv_load_balanced: kv_load formula + idle_boost + softmax ---- #
+        # Same as kv_load but with:
+        #   - idle_boost: idle workers get a minimum overlap credit
+        #   - softmax with temperature instead of deterministic argmin
+        if self.router_type == "kv_load_balanced":
+            worker_list = [int(w) for w in worker_ids]
+            raw_scores: list[float] = []
+            per_worker_ctx: dict[int, dict[str, float]] = {}
+            all_overlaps: dict[int, float] = {}
+            request_blocks = math.ceil(len(req.tokens) / self.block_size)
+
+            for wid in worker_list:
+                overlap = float(scores.scores.get(wid, 0.0))
+                prefill_cost = self._prefill_cost_for_worker(req.tokens, overlap)
+
+                overlap_blocks = scores.raw_block_counts.get(wid, 0)
+                boosted_blocks = max(overlap_blocks, int(self.idle_boost * scores.total_blocks)) if scores.total_blocks > 0 else overlap_blocks
+                prefill_tokens = max(0, len(req.tokens) - boosted_blocks * self.block_size)
+                potential_prefill_blocks = prefill_tokens / self.block_size
+
+                routed = float(self._kv_load_routed_count(wid))
+                decode_blocks = routed * request_blocks
+
+                logit = self.kv_load_overlap_weight * potential_prefill_blocks + decode_blocks
+                score = -logit
+
+                raw_scores.append(score)
+                all_overlaps[wid] = max(overlap, self.idle_boost)
+                per_worker_ctx[wid] = {
+                    "decode_cost": decode_cost,
+                    "prefill_cost": prefill_cost,
+                    "iat_factor": iat_factor,
+                    "overlap": overlap,
+                    "reuse_after": float(reuse_after),
+                    "load_mod": 1.0 / (1.0 + routed),
+                }
+
+            probs = self._softmax(raw_scores, self.kv_load_temp)
+            r = random.random()
+            cum = 0.0
+            idx = 0
+            for i, p in enumerate(probs):
+                cum += p
+                if r <= cum:
+                    idx = i
+                    break
+            chosen = int(worker_list[idx])
+
+            self._kv_load_track(chosen)
+            detail = " ".join(
+                f"w{wid}=[ov={all_overlaps[wid]:.3f} sc={raw_scores[i]:.3f}]"
+                for i, wid in enumerate(worker_list)
+            )
+            logger.info(
+                "kv_load_balanced: prefix=%s chosen=%s workers=[%s]",
+                req.prefix_id, chosen, detail,
+            )
+
+            return chosen, per_worker_ctx[chosen], per_worker_ctx, raw_scores, probs
+
+        # ---- kv_thompson: modular scoring with togglable features ---- #
+        if self.router_type == "kv_thompson":
+            worker_list = [int(w) for w in worker_ids]
+            raw_scores: list[float] = []
+            per_worker_ctx: dict[int, dict[str, float]] = {}
+            all_overlaps: dict[int, float] = {}
+
+            qpw = self.kv_thompson_queue_pw if self.kv_thompson_queue_pw is not None else self.queue_penalty_weight
+
+            for wid in worker_list:
+                overlap = float(scores.scores.get(wid, 0.0))
+                prefill_cost = self._prefill_cost_for_worker(req.tokens, overlap)
+                job_cost_total = decode_cost + prefill_cost
+
+                effective_overlap = max(overlap, self.idle_boost)
+
+                q = 0.0  # raw queue depth (populated in non-full-load path)
+                if self.kt_enable_full_load:
+                    load_mod = self._load_score(wid, metrics, job_cost_total=job_cost_total)
+                else:
+                    queue = 0.0
+                    if metrics and isinstance(metrics, dict) and "endpoints" in metrics:
+                        for ep in metrics["endpoints"]:
+                            if ep.get("worker_id") == wid:
+                                queue = float(ep.get("num_requests_waiting", 0.0))
+                                break
+                    # Exponential quadratic penalty: gentle at low queue, aggressive at high.
+                    # load_mod = exp(-qpw * queue² / 25)
+                    # At queue=1: ~exp(-qpw/25) ≈ 0.90 (barely noticeable)
+                    # At queue=5: exp(-qpw) (the "knee" — qpw directly controls severity here)
+                    # At queue=10: exp(-4*qpw) (effectively zero)
+                    q = max(0.0, queue)
+                    load_mod = math.exp(-qpw * q * q / 25.0)
+
+                if self.kt_enable_sticky_floor and last_w == wid and reuse_after > 0:
+                    load_mod = max(load_mod, self.kt_sticky_load_floor)
+
+                # Global minimum floor: prevents load_mod from collapsing to
+                # zero under high queue depth, which would erase the KV overlap
+                # signal entirely and leave only LinTS to route.
+                if self.kt_load_mod_floor > 0.0:
+                    load_mod = max(load_mod, self.kt_load_mod_floor)
+
+                score_base = effective_overlap * load_mod
+                score = score_base
+
+                if self.kt_enable_adaptive_explore:
+                    ts_w_eff = self.kv_ts_weight / (1.0 + float(reuse_after) * iat_factor)
+                else:
+                    ts_w_eff = self.kv_ts_weight
+                score += ts_w_eff * self._ts_sample(wid)
+
+                score_lints = 0.0
+                if self.kt_enable_lints:
+                    x = self._feature_vector(
+                        wid=wid, metrics=metrics, scores=scores, last_w=last_w,
+                        reuse_after=reuse_after, decode_cost=decode_cost,
+                        prefill_cost=prefill_cost, iat_factor=iat_factor,
+                    )
+                    raw_lints = self._linTS_sample(wid, x)
+                    if self.kt_lints_weight < 0:
+                        # Negative weight enables tanh normalization: bounds
+                        # LinTS output to [-1, 1] then scales by |weight|.
+                        # This keeps LinTS as a tiebreaker rather than the
+                        # dominant signal.
+                        score_lints = abs(self.kt_lints_weight) * math.tanh(raw_lints)
+                    else:
+                        score_lints = self.kt_lints_weight * raw_lints
+                    score += score_lints
+
+                score_affinity = 0.0
+                if self.kt_enable_affinity and last_w == wid and reuse_after > 0:
+                    # Scale affinity bonus by load_mod so that stickiness shrinks
+                    # as the worker's queue grows.  This prevents the lock-in
+                    # cascade where a flat affinity bonus overrides the queue
+                    # penalty and traps sessions on an overloaded worker.
+                    # At load_mod=1 (idle):   full affinity bonus preserved
+                    # At load_mod=0.1 (floor, deep queue): bonus is 10% of normal
+                    # → high-overlap idle alternatives can now win the decision.
+                    score_affinity = (self.kt_affinity_base
+                                      + self.kt_affinity_reuse_weight * float(reuse_after)) * (0.5 + 0.5 * overlap) * load_mod
+                    score += score_affinity
+
+                score_switch = 0.0
+                if self.kt_enable_switching_cost and last_w is not None and wid != last_w and reuse_after > 0:
+                    score_switch = -(self.kt_switch_base
+                                     + self.kt_switch_reuse * float(reuse_after))
+                    score += score_switch
+
+                if np.isnan(score) or np.isinf(score):
+                    score = -1e9
+
+                raw_scores.append(float(score))
+                all_overlaps[wid] = overlap
+                per_worker_ctx[wid] = {
+                    "decode_cost": decode_cost,
+                    "prefill_cost": prefill_cost,
+                    "iat_factor": iat_factor,
+                    "overlap": overlap,
+                    "reuse_after": float(reuse_after),
+                    "load_mod": load_mod,
+                    "queue": q,
+                    "score_base": score_base,
+                    "score_lints": score_lints,
+                    "score_affinity": score_affinity,
+                    "score_switch": score_switch,
+                }
+
+            best = max(all_overlaps.values()) if all_overlaps else 0.0
+            if best < self.kv_thompson_cold_start:
+                idx = self._cold_start_rr % len(worker_list)
+                self._cold_start_rr += 1
+                chosen = int(worker_list[idx])
+                probs = [1.0 / len(worker_list)] * len(worker_list)
+                logger.info(
+                    "kv_thompson: COLD_START prefix=%s chosen=%s best_ov=%.4f "
+                    "threshold=%.4f rr_idx=%d/%d",
+                    req.prefix_id, chosen, best,
+                    self.kv_thompson_cold_start, idx, len(worker_list),
+                )
+            else:
+                if self.kt_enable_adaptive_temp:
+                    temp = self.kt_adaptive_temp_base / (1.0 + float(reuse_after) * iat_factor)
+                    temp = min(max(temp, self.temp_min), self.temp_max)
+                else:
+                    temp = self.kv_load_temp
+                probs = self._softmax(raw_scores, temp)
+                r = random.random()
+                cum = 0.0
+                idx = 0
+                for i, p in enumerate(probs):
+                    cum += p
+                    if r <= cum:
+                        idx = i
+                        break
+                chosen = int(worker_list[idx])
+
+            detail = " ".join(
+                f"w{wid}=[ov={all_overlaps[wid]:.3f} q={int(per_worker_ctx[wid]['queue'])} "
+                f"ld={per_worker_ctx[wid]['load_mod']:.3f} "
+                f"sc={raw_scores[i]:.3f} p={probs[i]:.3f}]"
+                for i, wid in enumerate(worker_list)
+            )
+            logger.info(
+                "kv_thompson: prefix=%s chosen=%s best_ov=%.4f "
+                "params=[ts_w=%.4f idle=%.4f qpw=%.4f temp=%.4f cold=%.4f] "
+                "features=[lints=%s affinity=%s switch=%s full_load=%s adapt_t=%s adapt_e=%s sticky=%s] "
+                "workers=[%s]",
+                req.prefix_id, chosen, best,
+                self.kv_ts_weight, self.idle_boost, qpw,
+                self.kv_load_temp, self.kv_thompson_cold_start,
+                self.kt_enable_lints, self.kt_enable_affinity,
+                self.kt_enable_switching_cost, self.kt_enable_full_load,
+                self.kt_enable_adaptive_temp, self.kt_enable_adaptive_explore,
+                self.kt_enable_sticky_floor,
+                detail,
+            )
+            # Per-component breakdown for the chosen worker to aid debugging.
+            if chosen in per_worker_ctx:
+                ctx_c = per_worker_ctx[chosen]
+                logger.info(
+                    "kv_thompson chosen_breakdown: prefix=%s worker=%s q=%d "
+                    "base=%+.3f lints=%+.3f affinity=%+.3f switch=%+.3f total=%.3f",
+                    req.prefix_id, chosen, int(ctx_c["queue"]),
+                    ctx_c["score_base"], ctx_c["score_lints"],
+                    ctx_c["score_affinity"], ctx_c["score_switch"],
+                    raw_scores[worker_list.index(chosen)],
+                )
+
+            # ---- KV opportunity-cost analysis ----
+            # For every routing decision, find the "best idle" worker (q=0 or
+            # lowest queue) and compare its KV overlap with the chosen worker.
+            # This shows the trade-off: how much KV coverage did we gain/lose
+            # by routing to a busier worker instead of the most available one?
+            chosen_q    = int(per_worker_ctx[chosen]["queue"])
+            chosen_ov   = all_overlaps[chosen]
+
+            # Find best-idle: among q=0 workers, pick highest overlap.
+            # Fall back to lowest-queue worker if none are fully idle.
+            idle_workers = [(wid, all_overlaps[wid], int(per_worker_ctx[wid]["queue"]))
+                            for wid in worker_list]
+            min_q = min(q for _, _, q in idle_workers)
+            min_q_workers = [(wid, ov) for wid, ov, q in idle_workers if q == min_q]
+            best_idle_wid, best_idle_ov = max(min_q_workers, key=lambda x: x[1])
+
+            kv_delta = chosen_ov - best_idle_ov  # + means we're on a better KV worker
+            kv_available_on_idle = best_idle_ov  # how much we'd get if we routed to idle
+
+            # Estimate uncached tokens for chosen vs idle paths
+            isl = len(req.tokens)
+            uncached_chosen = max(0.0, isl * (1.0 - chosen_ov))
+            uncached_idle   = max(0.0, isl * (1.0 - best_idle_ov))
+            extra_cold_tokens = uncached_idle - uncached_chosen  # tokens we save by staying sticky
+
+            if chosen_q > 0 and min_q == 0:
+                # Routed to a queued worker while idle capacity existed
+                logger.info(
+                    "kv_opportunity: prefix=%s QUEUED_PREFERRED: chosen=w%s q=%d ov=%.3f "
+                    "vs idle=w%s q=0 ov=%.3f  kv_delta=%+.3f  "
+                    "extra_cold_tokens=%.0f (ISL=%d tokens — KV gained by staying sticky)",
+                    req.prefix_id, str(chosen)[-5:], chosen_q, chosen_ov,
+                    str(best_idle_wid)[-5:], best_idle_ov,
+                    kv_delta, extra_cold_tokens, isl,
+                )
+                if self._metrics.get("routed_to_queued"):
+                    self._metrics["routed_to_queued"].inc()
+            elif chosen == best_idle_wid:
+                # Chose the lowest-queue worker AND it had good KV coverage
+                logger.debug(
+                    "kv_opportunity: prefix=%s IDLE_MATCH: chosen=w%s q=%d ov=%.3f (optimal)",
+                    req.prefix_id, str(chosen)[-5:], chosen_q, chosen_ov,
+                )
+            else:
+                # Both workers have queue — picked higher-overlap one
+                logger.debug(
+                    "kv_opportunity: prefix=%s ALL_BUSY: chosen=w%s q=%d ov=%.3f "
+                    "vs best_low_q=w%s q=%d ov=%.3f  kv_delta=%+.3f",
+                    req.prefix_id, str(chosen)[-5:], chosen_q, chosen_ov,
+                    str(best_idle_wid)[-5:], min_q, best_idle_ov, kv_delta,
+                )
+
+            # Prometheus metrics (emitted on every decision)
+            if self._metrics.get("kv_vs_idle_delta"):
+                self._metrics["kv_vs_idle_delta"].observe(kv_delta)
+            if self._metrics.get("idle_kv_miss"):
+                self._metrics["idle_kv_miss"].observe(best_idle_ov)
+
+            return chosen, per_worker_ctx[chosen], per_worker_ctx, raw_scores, probs
 
         temp = self.temp_base / (1.0 + float(reuse_after) * iat_factor)
         temp = min(max(temp, self.temp_min), self.temp_max)
@@ -1037,12 +1546,10 @@ class WorkloadAwareRouter:
             val += explore_w * self._ts_sample(wid)
 
             if last_w == wid and (reuse_after > 0):
-                val += (self.affinity_base + self.affinity_reuse_weight * float(reuse_after) +
-                        self.affinity_iat_weight * iat_factor) * (0.5 + 0.5 * overlap)
+                val += (self.affinity_base + self.affinity_reuse_weight * float(reuse_after)) * (0.5 + 0.5 * overlap)
 
             if last_w is not None and wid != last_w and (reuse_after > 0):
-                val -= (self.switch_cost_base + self.switch_cost_reuse * float(reuse_after) +
-                        self.switch_cost_iat * iat_factor)
+                val -= (self.switch_cost_base + self.switch_cost_reuse * float(reuse_after))
 
             load_mod = self._load_score(wid, metrics, job_cost_total=job_cost_total)
             if last_w == wid and reuse_after > 0:
@@ -1174,14 +1681,26 @@ class WorkloadAwareRouter:
 
         metrics = self._build_internal_metrics(worker_ids)
         if self.router_type == "kv_load":
-            wid, _ = self._get_underloaded(metrics)
-            yield RouterResponse(worker_id=wid, prefix_hit_rate=0.0).model_dump()
+            scores: OverlapScores = await self.indexer.find_matches_for_request(req.tokens, 0)
+            chosen, overlap_chosen = self._select_worker_kv_load(worker_ids, req.tokens, metrics, scores)
+            self.indexer.record_routing_decision(chosen, req.tokens)
+            self._kv_load_track(chosen)
+            yield RouterResponse(worker_id=chosen, prefix_hit_rate=overlap_chosen).model_dump()
             return
 
         scores: OverlapScores = await self.indexer.find_matches_for_request(req.tokens, 0)
         chosen, chosen_ctx, all_ctx, raw_scores, probs = self._select_worker(worker_ids, req, metrics, scores)
 
+        # Record this decision so the local radix tree tracks which blocks
+        # are cached on which worker (same strategy as Dynamo's --no-kv-events mode).
+        self.indexer.record_routing_decision(chosen, req.tokens)
+
         last_w, _ = self._get_prefix(req.prefix_id)
+
+        # Consecutive same-worker counter: how many calls in a row this session
+        # has been routed to the same worker.  Used to detect affinity lock-in.
+        prev_consecutive = int(self.prefix_cache_state.get(req.prefix_id, {}).get("consecutive", 0))
+        consecutive = prev_consecutive + 1 if last_w == chosen else 1
 
         osl = self._norm_level(req.expected_osl, "MEDIUM")
         iat = self._norm_level(req.interarrival, "MEDIUM")
@@ -1198,6 +1717,7 @@ class WorkloadAwareRouter:
             decode_cost=decode_cost,
             prefill_cost=prefill_cost_chosen,
             iat_factor=iat_factor,
+            consecutive=consecutive,
         )
 
         # Build feature x for chosen & store pending decision
@@ -1225,6 +1745,7 @@ class WorkloadAwareRouter:
                 "overlap": overlap_chosen,
                 "prefill_cost": float(prefill_cost_chosen),
                 "decode_cost": float(decode_cost),
+                "consecutive": consecutive,
             }
             # Update pending count metric
             if self._metrics.get("pending_decisions"):
@@ -1235,6 +1756,9 @@ class WorkloadAwareRouter:
             self._metrics["decisions_total"].labels(worker_id=str(chosen)).inc()
         if self._metrics.get("kv_overlap"):
             self._metrics["kv_overlap"].labels(worker_id=str(chosen)).set(overlap_chosen)
+        if self._metrics.get("decisions_by_domain"):
+            domain = req.prefix_id.rsplit("-", 1)[0] if req.prefix_id else "unknown"
+            self._metrics["decisions_by_domain"].labels(worker_id=str(chosen), domain=domain).inc()
 
         # Track sticky vs switch decisions
         if last_w is not None:
@@ -1265,7 +1789,7 @@ class WorkloadAwareRouter:
 
         logger.info(
             "Router picked worker=%s decision=%s prefix=%s (last=%s reuse_after=%s osl=%s "
-            "prefill_cost=%.3f iat=%s overlap=%.3f)",
+            "prefill_cost=%.3f iat=%s overlap=%.3f consecutive=%d)",
             chosen,
             decision_id,
             req.prefix_id,
@@ -1275,6 +1799,7 @@ class WorkloadAwareRouter:
             prefill_cost_chosen,
             iat,
             overlap_chosen,
+            consecutive,
         )
 
         resp = RouterResponse(worker_id=chosen, prefix_hit_rate=overlap_chosen, decision_id=decision_id)
@@ -1306,6 +1831,8 @@ class WorkloadAwareRouter:
         x: np.ndarray = decision["x"]
         osl: str = str(decision["osl"])
         prefill_bin: str = str(decision["prefill_bin"])
+        elapsed_ms = (time.time() - decision.get("start_ts", time.time())) * 1000
+        consecutive: int = int(decision.get("consecutive", 0))
         tokens_out = None if fb.tokens_out is None else int(fb.tokens_out)
         metric, per_tok = self._latency_metric(float(fb.latency_ms), tokens_out)
 
@@ -1346,7 +1873,8 @@ class WorkloadAwareRouter:
             })
 
         logger.info(
-            "Feedback: wid=%s decision=%s metric=%.3f%s baseline=%.3f reward=%.3f success=%s",
+            "Feedback: wid=%s decision=%s metric=%.3f%s baseline=%.3f reward=%.3f success=%s "
+            "elapsed_ms=%.0f consecutive=%d",
             wid,
             fb.decision_id,
             metric,
@@ -1354,6 +1882,8 @@ class WorkloadAwareRouter:
             baseline_before,
             reward,
             fb.success,
+            elapsed_ms,
+            consecutive,
         )
 
         ack = FeedbackAck(ok=True, used_baseline=float(baseline_before), reward=float(reward), worker_id=wid)
@@ -1361,11 +1891,146 @@ class WorkloadAwareRouter:
         return
 
     # --------------------- helpers --------------------- #
+
+    def _kv_load_track(self, worker_id: int) -> None:
+        """Record that a request was just routed to *worker_id*."""
+        with self._kv_load_routed_lock:
+            self._kv_load_routed[worker_id] = self._kv_load_routed.get(worker_id, 0) + 1
+
+    def _kv_load_routed_count(self, worker_id: int) -> int:
+        """Return cumulative routes to *worker_id*."""
+        with self._kv_load_routed_lock:
+            return self._kv_load_routed.get(worker_id, 0)
+
+    def _select_worker_kv_load(
+        self,
+        worker_ids: list[int],
+        tokens: list[int],
+        metrics: dict[str, Any] | None,
+        scores: OverlapScores,
+    ) -> tuple[int, float]:
+        """Select worker replicating Dynamo's DefaultWorkerSelector formula.
+
+        Dynamo native (per worker):
+            logit = overlap_weight * prefill_blocks + decode_blocks
+
+        We replicate this with:
+            prefill_blocks = (ISL - overlap * block_size) / block_size
+            decode_blocks  = routed_count * avg_request_blocks
+
+        routed_count is the number of requests we've previously routed to
+        this worker (cumulative, tracked locally).  This is a direct analogue
+        of Dynamo's ActiveSequences which counts active blocks per worker
+        based on its own routing decisions — not scraped from the engine.
+
+        The product routed_count * avg_request_blocks puts the decode term
+        in the same block-count units as prefill_blocks so the two terms are
+        comparable, and the decode term grows without bound as requests pile
+        up, eventually forcing the router to spread load even when one worker
+        has a perfect cache hit.
+
+        Lower logit is better.  Temperature 0 = deterministic (Dynamo default).
+        """
+        if not worker_ids:
+            wid = int(random.choice(list(self.engine_client.instance_ids())))
+            return wid, 0.0
+
+        isl_tokens = len(tokens)
+        if isl_tokens == 0:
+            wid = int(random.choice(worker_ids))
+            return wid, 0.0
+
+        overlap_weight = self.kv_load_overlap_weight
+        temperature = self.kv_load_temperature
+        request_blocks = math.ceil(isl_tokens / self.block_size)
+
+        worker_logits: dict[int, float] = {}
+        worker_overlaps: dict[int, int] = {}
+
+        for wid in worker_ids:
+            overlap_blocks = scores.raw_block_counts.get(wid, 0)
+            worker_overlaps[wid] = overlap_blocks
+
+            prefill_tokens = max(0, isl_tokens - overlap_blocks * self.block_size)
+            potential_prefill_blocks = prefill_tokens / self.block_size
+
+            routed = float(self._kv_load_routed_count(wid))
+            decode_blocks = routed * request_blocks
+
+            logit = overlap_weight * potential_prefill_blocks + decode_blocks
+
+            worker_logits[wid] = logit
+
+            logger.info(
+                "kv_load: worker=%s overlap=%d prefill=%.1f "
+                "decode=%.1f (routed=%.0f * req_blocks=%d) logit=%.1f",
+                wid, overlap_blocks, potential_prefill_blocks,
+                decode_blocks, routed, request_blocks, logit,
+            )
+
+        # Select worker via negative-logit softmax (lower logit = better = higher probability)
+        candidates = self._softmax_select_min_logit(worker_logits, temperature, scores.tree_sizes)
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            chosen = min(candidates, key=lambda w: scores.tree_sizes.get(w, 0))
+
+        total_blocks = scores.total_blocks
+        overlap_frac = float(worker_overlaps.get(chosen, 0)) / max(1, total_blocks)
+
+        tree_size = scores.tree_sizes.get(chosen, 0)
+        logger.info(
+            "kv_load: selected worker=%s logit=%.3f overlap_blocks=%d/%d (%.1f%%) tree_size=%d",
+            chosen, worker_logits[chosen], worker_overlaps.get(chosen, 0),
+            total_blocks, overlap_frac * 100, tree_size,
+        )
+
+        return chosen, overlap_frac
+
+    @staticmethod
+    def _softmax_select_min_logit(
+        logits: dict[int, float],
+        temperature: float,
+        tree_sizes: dict[int, int] | None = None,
+    ) -> list[int]:
+        """Softmax selection where lower logit = better.
+
+        Matches Dynamo's ``softmax_sample`` in scheduler.rs:
+        - temperature == 0 → return all keys with the minimum logit
+        - temperature > 0  → negate logits, apply softmax, sample one
+        """
+        if not logits:
+            return []
+
+        keys = list(logits.keys())
+        if len(keys) == 1:
+            return keys
+
+        if temperature <= 0.0:
+            min_val = min(logits.values())
+            return [k for k, v in logits.items() if abs(v - min_val) < 1e-9]
+
+        neg_logits = [-logits[k] for k in keys]
+        max_neg = max(neg_logits)
+        exp_values = [math.exp((v - max_neg) / temperature) for v in neg_logits]
+        sum_exp = sum(exp_values)
+        probabilities = [v / sum_exp for v in exp_values]
+
+        sample = random.random()
+        cumsum = 0.0
+        for i, prob in enumerate(probabilities):
+            cumsum += prob
+            if sample <= cumsum:
+                return [keys[i]]
+
+        return [keys[-1]]
+
     def _get_underloaded(self, metrics: dict[str, Any] | None):
         if not metrics or not metrics.get("endpoints"):
             wid = int(random.choice(list(self.engine_client.instance_ids())))
             return wid, 0.0
-        loads = {ep.get("worker_id"): ep.get("gpu_cache_usage_perc", 0.0) for ep in metrics["endpoints"]}
+        loads = {ep.get("worker_id"): ep.get("locked_kv_cache_perc", 0.0) for ep in metrics["endpoints"]}
         min_val = min(loads.values())
         candidates = [wid for wid, v in loads.items() if v == min_val]
         return random.choice(candidates), min_val
@@ -1509,6 +2174,40 @@ async def worker(runtime: DistributedRuntime):
         pending_sweep_interval_seconds=get_nested(config, "feedback.sweep_interval_seconds", 5.0),
         timeout_reward=get_nested(config, "feedback.timeout_reward", 0.0),
         latency_ema_alpha=get_nested(config, "feedback.latency_ema_alpha", 0.2),
+        # kv_load (Dynamo-native)
+        kv_load_overlap_weight=get_nested(config, "kv_load.overlap_score_weight", 1.0),
+        kv_load_temperature=get_nested(config, "kv_load.temperature", 0.0),
+        metrics_scrape_interval=get_nested(config, "kv_thompson.metrics_scrape_interval",
+                                get_nested(config, "kv_load.metrics_scrape_interval", 0.1)),
+        # kv_load_balanced / kv_thompson
+        idle_boost=get_nested(config, "kv_thompson.idle_boost",
+                   get_nested(config, "kv_load_balanced.idle_boost", 0.02)),
+        kv_load_temp=get_nested(config, "kv_thompson.temperature",
+                     get_nested(config, "kv_load_balanced.temperature", 0.15)),
+        kv_ts_weight=get_nested(config, "kv_thompson.ts_weight", 0.05),
+        kv_thompson_queue_penalty_weight=(
+            get_nested(config, "kv_thompson.queue_penalty_weight", None)
+            or get_nested(config, "load_balancing.queue_penalty_weight", 1.50)
+        ),
+        kv_thompson_cold_start=get_nested(config, "kv_thompson.cold_start_threshold", 0.05),
+        # kv_thompson feature toggles
+        kt_enable_lints=get_nested(config, "kv_thompson.enable_lints", False),
+        kt_enable_affinity=get_nested(config, "kv_thompson.enable_affinity", False),
+        kt_enable_switching_cost=get_nested(config, "kv_thompson.enable_switching_cost", False),
+        kt_enable_full_load=get_nested(config, "kv_thompson.enable_full_load", False),
+        kt_enable_adaptive_temp=get_nested(config, "kv_thompson.enable_adaptive_temp", False),
+        kt_enable_adaptive_explore=get_nested(config, "kv_thompson.enable_adaptive_explore", False),
+        kt_enable_sticky_floor=get_nested(config, "kv_thompson.enable_sticky_floor", False),
+        kt_lints_weight=get_nested(config, "kv_thompson.lints_weight", 1.0),
+        kt_affinity_base=get_nested(config, "kv_thompson.affinity_base", 0.30),
+        kt_affinity_reuse_weight=get_nested(config, "kv_thompson.affinity_reuse_weight", 0.08),
+        kt_affinity_iat_weight=get_nested(config, "kv_thompson.affinity_iat_weight", 0.20),
+        kt_switch_base=get_nested(config, "kv_thompson.switch_base", 0.10),
+        kt_switch_reuse=get_nested(config, "kv_thompson.switch_reuse", 0.04),
+        kt_switch_iat=get_nested(config, "kv_thompson.switch_iat", 0.03),
+        kt_sticky_load_floor=get_nested(config, "kv_thompson.sticky_load_floor", 0.01),
+        kt_load_mod_floor=get_nested(config, "kv_thompson.load_mod_floor", 0.0),
+        kt_adaptive_temp_base=get_nested(config, "kv_thompson.adaptive_temp_base", 1.0),
         # Debug
         debug_traces=get_nested(config, "debug.traces_enabled", False),
         debug_trace_dir=get_nested(config, "debug.trace_dir", "/tmp/dynamo_router_traces"),

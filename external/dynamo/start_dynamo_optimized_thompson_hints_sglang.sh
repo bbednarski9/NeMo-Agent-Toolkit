@@ -329,7 +329,7 @@ if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
     if [ "$PROMETHEUS_RUNNING" = "false" ] || [ "$GRAFANA_RUNNING" = "false" ]; then
         echo "Starting monitoring stack (Prometheus + Grafana)..."
         cd "$MONITORING_DIR"
-        docker compose up -d
+        docker compose --env-file "${SCRIPT_DIR}/.env" up -d
         cd "$SCRIPT_DIR"
         
         # Wait for Prometheus to be ready

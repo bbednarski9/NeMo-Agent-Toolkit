@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dynamo SGLang FULL STACK with Unified Worker
-# Architecture: ETCD + NATS + Dynamo Frontend (API) → SGLang Backend Worker (Unified)
+# Dynamo vLLM FULL STACK with Unified Worker
+# Architecture: ETCD + NATS + Dynamo Frontend (API) → vLLM Backend Worker (Unified)
 #
 # This script manages ALL required components:
 #   - ETCD (metadata and worker discovery)
@@ -26,17 +26,25 @@
 # Frontend: Port 8099 (HTTP API)
 # ETCD: localhost:2379 (container: etcd-dynamo) - default port, override with DYNAMO_ETCD_PORT
 # NATS: localhost:4222 (container: nats-dynamo) - default port, override with DYNAMO_NATS_PORT
-# Worker runs in container: dynamo-sglang
+# Worker runs in container: dynamo-vllm
 #
 # To stop all components: bash stop_dynamo.sh
 
+# Load environment variables from .env file if present
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/.env" ]; then
+    set -a
+    source <(grep -v '^\s*#' "${SCRIPT_DIR}/.env" | sed 's/[[:space:]]*#.*$//')
+    set +a
+fi
+
 # Configuration Variables (can be overridden via environment variables)
-CONTAINER_NAME="dynamo-sglang"
+CONTAINER_NAME="dynamo-vllm"
 WORKER_GPUS="${DYNAMO_GPU_DEVICES:-0,1,2,3,4,5,6,7}"
 TP_SIZE="${DYNAMO_TP_SIZE:-2}"
 HTTP_PORT="${DYNAMO_HTTP_PORT:-8000}"
 SERVED_MODEL_NAME=""  # set after validation
-IMAGE="nvcr.io/nvidia/ai-dynamo/sglang-runtime:0.9.0"
+IMAGE="${DYNAMO_VLLM_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0}"
 SHM_SIZE="${DYNAMO_SHM_SIZE:-16g}"
 
 # Infrastructure ports (can be overridden via environment variables)
@@ -47,11 +55,11 @@ WORKER_INIT_TIMEOUT_S="${DYNAMO_WORKER_INIT_TIMEOUT_S:-1800}"
 
 # KV Cache-Aware Routing (optional)
 # Set ENABLE_KV_AWARE_ROUTING=true to enable KV cache-aware routing.
-# This adds --kv-cache-block-size to the frontend and --page-size to each worker
+# This adds --kv-cache-block-size to the frontend and --block-size to each worker
 # so the frontend can make routing decisions based on KV cache overlap.
 # The block size (in tokens) must match between the frontend and all workers.
 ENABLE_KV_AWARE_ROUTING="${ENABLE_KV_AWARE_ROUTING:-false}"
-KV_BLOCK_SIZE="${DYNAMO_KV_BLOCK_SIZE:-64}"
+KV_BLOCK_SIZE="${DYNAMO_KV_BLOCK_SIZE:-16}"
 
 # KV-aware routing requires KV events from workers to populate the radix tree.
 # Enforce DYNAMO_ENABLE_KV_EVENTS=true when KV-aware routing is enabled.
@@ -60,41 +68,25 @@ if [ "${ENABLE_KV_AWARE_ROUTING}" = "true" ]; then
     export DYNAMO_ENABLE_KV_EVENTS=true
 fi
 # Prometheus metrics base port for workers (each worker gets WORKER_METRICS_PORT+i).
-# --enable-metrics is always on so Prometheus/Grafana can scrape worker metrics.
 WORKER_METRICS_PORT="${DYNAMO_WORKER_METRICS_PORT:-18081}"
 
+# KV event ZMQ port base for workers (each worker gets KV_EVENT_BASE_PORT+i).
+# When DYNAMO_ENABLE_KV_EVENTS=true, each vLLM worker publishes KV cache events
+# over ZMQ. Each worker must bind a unique port to avoid collisions.
+KV_EVENT_BASE_PORT="${DYNAMO_KV_EVENT_BASE_PORT:-20080}"
+
 # Worker performance tuning (can be overridden via environment variables)
-# Fraction of GPU memory reserved for the KV cache (0.0-1.0)
-MEM_FRACTION_STATIC="${DYNAMO_MEM_FRACTION_STATIC:-0.9}"
-echo "MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC} (from DYNAMO_MEM_FRACTION_STATIC=${DYNAMO_MEM_FRACTION_STATIC:-<unset, using default 0.9>})"
+# Fraction of GPU memory for KV cache (0.0-1.0). 0.85 is safer than 0.9+ to avoid OOM during vLLM warmup.
+# Reads DYNAMO_MEM_FRACTION_STATIC first (shared with SGLang script), then DYNAMO_GPU_MEMORY_UTILIZATION
+GPU_MEMORY_UTILIZATION="${DYNAMO_MEM_FRACTION_STATIC:-${DYNAMO_GPU_MEMORY_UTILIZATION:-0.85}}"
+echo "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} (from DYNAMO_MEM_FRACTION_STATIC=${DYNAMO_MEM_FRACTION_STATIC:-<unset>} / DYNAMO_GPU_MEMORY_UTILIZATION=${DYNAMO_GPU_MEMORY_UTILIZATION:-<unset, using default 0.85>})"
+# Maximum concurrent sequences per worker. Lower values use less memory during warmup.
+# vLLM default is 1024, but this can cause OOM on memory-constrained setups.
+MAX_NUM_SEQS="${DYNAMO_MAX_NUM_SEQS:-256}"
 # Maximum sequence length the model will handle (unset = model default)
 MAX_MODEL_LEN="${DYNAMO_MAX_MODEL_LEN:-}"
 # Hard override for the number of GPU KV cache blocks (unset = auto)
 NUM_GPU_BLOCKS_OVERRIDE="${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE:-}"
-
-# HiCache (hierarchical KV cache) configuration
-# Enables CPU-backed overflow cache for the SGLang KV cache.
-ENABLE_HIERARCHICAL_CACHE="${DYNAMO_ENABLE_HIERARCHICAL_CACHE:-false}"
-HICACHE_RATIO="${DYNAMO_HICACHE_RATIO:-1.0}"
-HICACHE_POLICY="${DYNAMO_HICACHE_POLICY:-write_through}"
-
-# Validate HiCache settings when enabled
-if [ "${ENABLE_HIERARCHICAL_CACHE}" = "true" ]; then
-    if ! printf '%s' "$HICACHE_RATIO" | grep -qE '^[0-9]*\.?[0-9]+$' || \
-       [ "$(awk -v v="$HICACHE_RATIO" 'BEGIN{print (v+0)<=0 ? 1 : 0}')" = "1" ]; then
-        echo "ERROR: HICACHE_RATIO must be a positive number (got: '$HICACHE_RATIO')" >&2
-        echo "  Set via DYNAMO_HICACHE_RATIO (e.g., 1.0)" >&2
-        exit 1
-    fi
-    case "$HICACHE_POLICY" in
-        write_through|write_back) ;;
-        *)
-            echo "ERROR: HICACHE_POLICY must be 'write_through' or 'write_back' (got: '$HICACHE_POLICY')" >&2
-            echo "  Set via DYNAMO_HICACHE_POLICY" >&2
-            exit 1
-            ;;
-    esac
-fi
 
 # Compute container-internal GPU indices (GPUs are renumbered 0,1,2,... inside the container)
 NUM_GPUS=$(echo "$WORKER_GPUS" | tr ',' '\n' | wc -l)
@@ -166,7 +158,7 @@ MODEL="/workspace/models/$(basename "$LOCAL_MODEL_DIR")"
 SERVED_MODEL_NAME="${DYNAMO_MODEL_NAME:-$(basename "$LOCAL_MODEL_DIR")}"
 
 echo "========================================================="
-echo "Dynamo SGLang FULL STACK (UNIFIED MODE)"
+echo "Dynamo vLLM FULL STACK (UNIFIED MODE)"
 echo "========================================================="
 echo "Model: $SERVED_MODEL_NAME"
 echo "Container: $CONTAINER_NAME"
@@ -176,11 +168,13 @@ echo "Components:"
 echo "  - ETCD (metadata and discovery)"
 echo "  - NATS (message queue for requests)"
 echo "  - Dynamo Frontend (HTTP API on port $HTTP_PORT)"
-echo "  - SGLang Worker (unified mode)"
+echo "  - vLLM Worker (unified mode)"
 echo ""
 echo "Backend Workers:"
 echo "  Workers: $NUM_WORKERS (GPUs: $NUM_GPUS, TP=$TP_SIZE per worker)"
 echo "  GPUs: $WORKER_GPUS"
+echo "  GPU Memory Utilization: $GPU_MEMORY_UTILIZATION"
+echo "  Max Num Seqs: $MAX_NUM_SEQS"
 echo "  Mode: UNIFIED (no prefill/decode disaggregation)"
 echo ""
 echo "Routing Mode:"
@@ -190,15 +184,6 @@ if [ "${ENABLE_KV_AWARE_ROUTING}" = "true" ]; then
 else
     echo "  Round-Robin (default)"
     echo "  Set ENABLE_KV_AWARE_ROUTING=true to enable KV cache-aware routing"
-fi
-echo ""
-echo "HiCache:"
-if [ "${ENABLE_HIERARCHICAL_CACHE}" = "true" ]; then
-    echo "  Enabled (DYNAMO_ENABLE_HIERARCHICAL_CACHE=true)"
-    echo "  Ratio: $HICACHE_RATIO, Policy: $HICACHE_POLICY"
-else
-    echo "  Disabled (default)"
-    echo "  Set DYNAMO_ENABLE_HIERARCHICAL_CACHE=true to enable"
 fi
 echo ""
 echo "========================================================="
@@ -272,7 +257,7 @@ done
 echo ""
 
 # Start monitoring stack (Prometheus + Grafana) if not running
-MONITORING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/monitoring"
+MONITORING_DIR="${SCRIPT_DIR}/monitoring"
 if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
     PROMETHEUS_RUNNING=$(docker ps --format '{{.Names}}' | grep -q "^dynamo-prometheus$" && echo "true" || echo "false")
     GRAFANA_RUNNING=$(docker ps --format '{{.Names}}' | grep -q "^dynamo-grafana$" && echo "true" || echo "false")
@@ -372,9 +357,9 @@ if [ ! -d "$LOCAL_MODEL_DIR" ]; then
     fi
 fi
 
-# Start container with unified SGLang worker + Dynamo frontend
+# Start container with unified vLLM worker + Dynamo frontend
 echo ""
-echo "Starting Dynamo container with unified SGLang worker + frontend..."
+echo "Starting Dynamo container with unified vLLM worker + frontend..."
 docker run -d \
   --name $CONTAINER_NAME \
   --gpus "\"device=${WORKER_GPUS}\"" \
@@ -394,11 +379,13 @@ docker run -d \
   -e DYNAMO_WORKER_COMPONENT=backend \
   -e ENABLE_KV_AWARE_ROUTING=$ENABLE_KV_AWARE_ROUTING \
   -e KV_BLOCK_SIZE=$KV_BLOCK_SIZE \
+  -e GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION \
+  -e MAX_NUM_SEQS=$MAX_NUM_SEQS \
   -e MAX_MODEL_LEN=$MAX_MODEL_LEN \
   -e NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE \
-  -e ENABLE_HIERARCHICAL_CACHE=$ENABLE_HIERARCHICAL_CACHE \
-  -e HICACHE_RATIO=$HICACHE_RATIO \
-  -e HICACHE_POLICY=$HICACHE_POLICY \
+  -e DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV=${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV:-} \
+  -e DYNAMO_ENABLE_KV_EVENTS=${DYNAMO_ENABLE_KV_EVENTS:-false} \
+  -e KV_EVENT_BASE_PORT=$KV_EVENT_BASE_PORT \
   $IMAGE \
   bash -c "
     set -e  # Exit on any error
@@ -484,8 +471,19 @@ docker run -d \
     }
 
     echo '========================================================='
-    echo 'Step 1: Starting $NUM_WORKERS Unified Worker(s) (Host GPUs $WORKER_GPUS -> Container GPUs $CONTAINER_GPU_INDICES)...'
+    echo 'Step 1: Starting $NUM_WORKERS Unified vLLM Worker(s) (Host GPUs $WORKER_GPUS -> Container GPUs $CONTAINER_GPU_INDICES)...'
     echo '========================================================='
+
+    # Build optional --num-gpu-blocks-override flag (for cache size experiments)
+    # Supports heterogeneous cache sizes via DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV (comma-separated per worker).
+    # Example: DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV=500,1000,1500,2000,2500,3000,3500,3850
+    # Falls back to uniform DYNAMO_NUM_GPU_BLOCKS_OVERRIDE if CSV is not set.
+    GPU_BLOCKS_CSV=\"${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV:-}\"
+    if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
+        echo \"GPU Blocks Override (heterogeneous): \$GPU_BLOCKS_CSV\"
+    elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
+        echo \"GPU Blocks Override (uniform): $NUM_GPU_BLOCKS_OVERRIDE (experiment mode - limited cache!)\"
+    fi
 
     # Start multiple workers, each using TP_SIZE GPUs
     WORKER_PIDS=()
@@ -494,42 +492,52 @@ docker run -d \
         START_GPU=\$((i * $TP_SIZE))
         END_GPU=\$(((i + 1) * $TP_SIZE - 1))
         WORKER_GPU_LIST=\$(seq -s, \$START_GPU \$END_GPU)
-        WORKER_PORT=\$((30000 + i))
 
-        echo \"Starting Worker \$i: GPUs \$WORKER_GPU_LIST, Port \$WORKER_PORT\"
-        # Build optional flags for the worker
-        # --enable-metrics is always on so Prometheus/Grafana can scrape worker metrics
-        EXTRA_WORKER_FLAGS=\"--enable-metrics\"
-        if [ \"\$ENABLE_KV_AWARE_ROUTING\" = \"true\" ]; then
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --page-size \$KV_BLOCK_SIZE\"
-        fi
+        # NIXL side channel ports for KV transfer handshake (TP_SIZE consecutive ports per worker)
+        NIXL_BASE_PORT=\$((5557 + i * $TP_SIZE))
+
+        echo \"Starting vLLM Worker \$i: GPUs \$WORKER_GPU_LIST\"
+        echo \"  KV Block Size: $KV_BLOCK_SIZE tokens, GPU Mem Util: $GPU_MEMORY_UTILIZATION, Max Seqs: $MAX_NUM_SEQS\"
+
+        EXTRA_WORKER_FLAGS=\"\"
         if [ -n \"\$MAX_MODEL_LEN\" ]; then
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --max-total-tokens \$MAX_MODEL_LEN\"
+            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --max-model-len \$MAX_MODEL_LEN\"
         fi
-        if [ -n \"\$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --num-gpu-blocks-override \$NUM_GPU_BLOCKS_OVERRIDE\"
+
+        # Per-worker GPU blocks override (heterogeneous cache sizes)
+        GPU_BLOCKS_OVERRIDE_OPT=\"\"
+        if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
+            WORKER_BLOCKS=\$(echo \"\$GPU_BLOCKS_CSV\" | cut -d, -f\$((i + 1)))
+            if [ -n \"\$WORKER_BLOCKS\" ]; then
+                GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override \$WORKER_BLOCKS\"
+                echo \"  GPU Blocks Override: \$WORKER_BLOCKS\"
+            fi
+        elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
+            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE\"
+            echo \"  GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE\"
         fi
-        if [ \"\$ENABLE_HIERARCHICAL_CACHE\" = \"true\" ]; then
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --enable-hierarchical-cache\"
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --hicache-ratio \$HICACHE_RATIO\"
-            EXTRA_WORKER_FLAGS=\"\$EXTRA_WORKER_FLAGS --hicache-write-policy \$HICACHE_POLICY\"
-        fi
-        # DYN_SYSTEM_PORT: unique Prometheus metrics port per worker (required by --enable-metrics;
-        # workers share the host network so each needs a distinct port).
+
+        # DYN_SYSTEM_PORT: unique Prometheus metrics port per worker
+        # (workers share the host network so each needs a distinct port).
         # DYN_NAMESPACE=workers: puts workers in the workers namespace so the Grafana dashboard
         # Request Flow panel Worker series (filtered on namespace=workers) is populated.
         # dynamo.frontend is started with --namespace workers below to match.
+        # dynamo.vllm does NOT accept --host/--port/--endpoint like dynamo.sglang;
+        # namespace is set via DYN_NAMESPACE env var.
         CUDA_VISIBLE_DEVICES=\$WORKER_GPU_LIST \
         DYN_SYSTEM_PORT=\$((${WORKER_METRICS_PORT} + i)) \
+        DYN_VLLM_KV_EVENT_PORT=\$(($KV_EVENT_BASE_PORT + i)) \
         DYN_NAMESPACE=workers \
-        python3 -m dynamo.sglang \
-          --model-path $MODEL \
+        VLLM_NIXL_SIDE_CHANNEL_PORT=\$NIXL_BASE_PORT \
+        python3 -m dynamo.vllm \
+          --model $MODEL \
           --served-model-name $SERVED_MODEL_NAME \
-          --host 0.0.0.0 \
-          --port \$WORKER_PORT \
-          --tp $TP_SIZE \
+          --tensor-parallel-size $TP_SIZE \
           --trust-remote-code \
-          --mem-fraction-static $MEM_FRACTION_STATIC \
+          --block-size $KV_BLOCK_SIZE \
+          --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
+          --max-num-seqs $MAX_NUM_SEQS \
+          \$GPU_BLOCKS_OVERRIDE_OPT \
           \$EXTRA_WORKER_FLAGS &
         WORKER_PIDS+=(\$!)
         echo \"  Worker \$i PID: \${WORKER_PIDS[\$i]}\"
@@ -554,16 +562,17 @@ docker run -d \
     echo 'Step 2: Starting Dynamo Frontend (HTTP API on port $HTTP_PORT)...'
     echo '========================================================='
     # Build optional KV cache flag for the frontend
-    # Worker metrics are always available (--enable-metrics is always on)
     echo \"Worker metrics: http://localhost:$WORKER_METRICS_PORT/metrics ... http://localhost:\$((${WORKER_METRICS_PORT} + $NUM_WORKERS - 1))/metrics\"
     KV_FRONTEND_FLAGS=\"\"
     if [ \"\$ENABLE_KV_AWARE_ROUTING\" = \"true\" ]; then
         echo \"KV Cache-Aware Routing enabled (block size: \$KV_BLOCK_SIZE tokens)\"
-        # --router-mode kv: switches the frontend from default routing to KV-aware routing
-        # --kv-cache-block-size: sets block size for KV overlap computation (must match worker --page-size)
-        # --no-kv-events: router predicts cache state from its own routing decisions
-        #   (workers in unified mode don't publish kv-events-config, so events are unavailable)
-        KV_FRONTEND_FLAGS=\"--router-mode kv --kv-cache-block-size \$KV_BLOCK_SIZE --no-kv-events\"
+        if [ \"\$DYNAMO_ENABLE_KV_EVENTS\" = \"true\" ]; then
+            echo \"KV events enabled — frontend will consume worker KV event streams\"
+            KV_FRONTEND_FLAGS=\"--router-mode kv --kv-cache-block-size \$KV_BLOCK_SIZE\"
+        else
+            echo \"KV events disabled — frontend predicts cache state from routing decisions\"
+            KV_FRONTEND_FLAGS=\"--router-mode kv --kv-cache-block-size \$KV_BLOCK_SIZE --no-kv-events\"
+        fi
     fi
     python3 -m dynamo.frontend \
       --http-port=$HTTP_PORT \
@@ -586,11 +595,11 @@ docker run -d \
     echo \"  NATS: localhost:$NATS_PORT\"
     echo \"\"
     echo \"Dynamo Components (This Container):\"
-    echo \"  Unified Workers: \${#WORKER_PIDS[@]} workers (GPUs $WORKER_GPUS, TP=$TP_SIZE each)\"
+    echo \"  vLLM Unified Workers: \${#WORKER_PIDS[@]} workers (GPUs $WORKER_GPUS, TP=$TP_SIZE each)\"
     for i in \$(seq 0 \$((\${#WORKER_PIDS[@]} - 1))); do
         START_GPU=\$((i * $TP_SIZE))
         END_GPU=\$(((i + 1) * $TP_SIZE - 1))
-        echo \"    Worker \$i: PID \${WORKER_PIDS[\$i]}, GPUs \$START_GPU-\$END_GPU, port \$((30000 + i))\"
+        echo \"    Worker \$i: PID \${WORKER_PIDS[\$i]}, GPUs \$START_GPU-\$END_GPU\"
     done
     echo \"  Frontend: PID \$FRONTEND_PID  (HTTP API on port $HTTP_PORT)\"
     echo ''
@@ -630,7 +639,7 @@ sleep 15
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo ""
     echo "========================================================="
-    echo "✓ Dynamo SGLang FULL STACK Started (UNIFIED MODE)!"
+    echo "✓ Dynamo vLLM FULL STACK Started (UNIFIED MODE)!"
     echo "========================================================="
     echo ""
     echo "Architecture:"
@@ -640,9 +649,9 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "    ↓"
     echo "  Frontend discovers workers via ETCD"
     echo "    ↓"
-    echo "  Frontend routes to one of $NUM_WORKERS Unified Workers"
+    echo "  Frontend routes to one of $NUM_WORKERS vLLM Unified Workers"
     echo "    ↓              (localhost:$ETCD_CLIENT_PORT - worker discovery)"
-    echo "  Unified Workers ($NUM_WORKERS x TP=$TP_SIZE = $NUM_GPUS GPUs total)"
+    echo "  vLLM Unified Workers ($NUM_WORKERS x TP=$TP_SIZE = $NUM_GPUS GPUs total)"
     echo "    ↓"
     echo "  Response"
     echo ""
@@ -652,7 +661,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo ""
     echo "Dynamo Components (This Container):"
     echo "  Frontend: HTTP API on port $HTTP_PORT"
-    echo "  Unified Workers: $NUM_WORKERS workers (TP=$TP_SIZE each, ports 30000-$((30000 + NUM_WORKERS - 1)))"
+    echo "  vLLM Unified Workers: $NUM_WORKERS workers (TP=$TP_SIZE each)"
     echo ""
     echo "Prometheus Metrics Endpoints:"
     echo "  Frontend: http://localhost:$HTTP_PORT/metrics"
@@ -710,7 +719,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo ""
     echo "========================================================="
     echo ""
-    echo "Waiting for SGLang to initialize (this will likely take 5-10 minutes for a 70B model)..."
+    echo "Waiting for vLLM to initialize (this will likely take 5-10 minutes for a 70B model)..."
     echo "Monitoring logs (Ctrl+C to exit, container continues)..."
     echo ""
 
@@ -723,7 +732,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         # Check /v1/models - only returns data when workers are registered
         models_response=$(curl -s http://localhost:$HTTP_PORT/v1/models 2>/dev/null)
         if echo "$models_response" | grep -q '"id"'; then
-            echo "✓ SGLang API is ready! (models discovered)"
+            echo "✓ vLLM API is ready! (models discovered)"
             break
         fi
         attempt=$((attempt + 1))

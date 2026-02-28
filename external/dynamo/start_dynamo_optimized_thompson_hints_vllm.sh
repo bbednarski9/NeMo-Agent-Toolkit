@@ -377,7 +377,7 @@ if [ -f "$MONITORING_DIR/docker-compose.yml" ]; then
     if [ "$PROMETHEUS_RUNNING" = "false" ] || [ "$GRAFANA_RUNNING" = "false" ]; then
         echo "Starting monitoring stack (Prometheus + Grafana)..."
         cd "$MONITORING_DIR"
-        docker compose up -d
+        docker compose --env-file "${SCRIPT_DIR}/.env" up -d
         cd "$SCRIPT_DIR"
         
         # Wait for Prometheus to be ready
@@ -653,10 +653,14 @@ docker run -d \
     fi
     
     # Build optional --num-gpu-blocks-override flag (for cache size experiments)
-    GPU_BLOCKS_OVERRIDE_OPT=\"\"
-    if [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
-        GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE\"
-        echo \"GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE (experiment mode - limited cache!)\"
+    # Supports heterogeneous cache sizes via DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV (comma-separated per worker).
+    # Example: DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV=3000,3000,3000,3000,6000,6000,6000,6000
+    # Falls back to uniform DYNAMO_NUM_GPU_BLOCKS_OVERRIDE if CSV is not set.
+    GPU_BLOCKS_CSV=\"${DYNAMO_NUM_GPU_BLOCKS_OVERRIDE_CSV:-}\"
+    if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
+        echo \"GPU Blocks Override (heterogeneous): \$GPU_BLOCKS_CSV\"
+    elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
+        echo \"GPU Blocks Override (uniform): $NUM_GPU_BLOCKS_OVERRIDE (experiment mode - limited cache!)\"
     fi
 
     # Start multiple workers, each using TP_SIZE GPUs
@@ -706,6 +710,19 @@ docker run -d \
             echo \"  Scheduler: DynamoScheduler with MultiLruBackend (frequency-based eviction)\"
         else
             echo \"  Scheduler: Default vLLM scheduler\"
+        fi
+
+        # Per-worker GPU blocks override (heterogeneous cache sizes)
+        GPU_BLOCKS_OVERRIDE_OPT=\"\"
+        if [ -n \"\$GPU_BLOCKS_CSV\" ]; then
+            WORKER_BLOCKS=\$(echo \"\$GPU_BLOCKS_CSV\" | cut -d, -f\$((i + 1)))
+            if [ -n \"\$WORKER_BLOCKS\" ]; then
+                GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override \$WORKER_BLOCKS\"
+                echo \"  GPU Blocks Override: \$WORKER_BLOCKS\"
+            fi
+        elif [ -n \"$NUM_GPU_BLOCKS_OVERRIDE\" ]; then
+            GPU_BLOCKS_OVERRIDE_OPT=\"--num-gpu-blocks-override $NUM_GPU_BLOCKS_OVERRIDE\"
+            echo \"  GPU Blocks Override: $NUM_GPU_BLOCKS_OVERRIDE\"
         fi
         
         if [ \"\$ENABLE_KV_EVENTS\" = \"true\" ]; then

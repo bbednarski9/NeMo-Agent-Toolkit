@@ -21,14 +21,20 @@
 #
 # Usage:
 #   bash stop_dynamo.sh                  # Stop Dynamo, ETCD, NATS only
+#   bash stop_dynamo.sh --keep-workers   # Stop ETCD/NATS but keep SGLang/vLLM workers running (faster restarts)
 #   bash stop_dynamo.sh --kill-metrics   # Also stop Prometheus and Grafana
 #   bash stop_dynamo.sh --clear-metrics  # Stop monitoring stack AND remove Prometheus data volume
 
 # Parse command line arguments
 KILL_METRICS=false
 CLEAR_METRICS=false
+KEEP_WORKERS=false
 for arg in "$@"; do
     case $arg in
+        --keep-workers)
+            KEEP_WORKERS=true
+            shift
+            ;;
         --kill-metrics)
             KILL_METRICS=true
             shift
@@ -42,6 +48,7 @@ for arg in "$@"; do
             echo "Usage: bash stop_dynamo.sh [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --keep-workers     Keep SGLang/vLLM worker containers running (skips model reload on restart)"
             echo "  --kill-metrics     Also stop Prometheus and Grafana containers"
             echo "  --clear-metrics    Stop monitoring stack AND remove Prometheus data volume (clears old metrics)"
             echo "  -h, --help         Show this help message"
@@ -51,41 +58,55 @@ for arg in "$@"; do
 done
 
 echo "========================================================="
-echo "Stopping Dynamo FULL STACK (SGLang/vLLM)"
+if [ "$KEEP_WORKERS" = true ]; then
+    echo "Stopping Dynamo INFRASTRUCTURE (keeping workers alive)"
+else
+    echo "Stopping Dynamo FULL STACK (SGLang/vLLM)"
+fi
 echo "========================================================="
 echo ""
 
 # Stop Dynamo containers (check for SGLang and vLLM variants)
-STOPPED_CONTAINER=false
+if [ "$KEEP_WORKERS" = true ]; then
+    echo "⏩ Skipping worker containers (--keep-workers)"
+    # List which workers are still running for visibility
+    for name in dynamo-sglang dynamo-sglang-thompson dynamo-vllm; do
+        if docker ps --format '{{.Names}}' | grep -q "^${name}$"; then
+            echo "  ↳ ${name} still running"
+        fi
+    done
+else
+    STOPPED_CONTAINER=false
 
-# SGLang containers
-if docker ps --format '{{.Names}}' | grep -q "^dynamo-sglang$"; then
-    echo "Stopping Dynamo container (SGLang)..."
-    docker stop dynamo-sglang
-    docker rm dynamo-sglang
-    echo "✓ Dynamo SGLang container stopped and removed"
-    STOPPED_CONTAINER=true
-fi
+    # SGLang containers
+    if docker ps --format '{{.Names}}' | grep -q "^dynamo-sglang$"; then
+        echo "Stopping Dynamo container (SGLang)..."
+        docker stop dynamo-sglang
+        docker rm dynamo-sglang
+        echo "✓ Dynamo SGLang container stopped and removed"
+        STOPPED_CONTAINER=true
+    fi
 
-if docker ps --format '{{.Names}}' | grep -q "^dynamo-sglang-thompson$"; then
-    echo "Stopping Dynamo container (SGLang Thompson Sampling)..."
-    docker stop dynamo-sglang-thompson
-    docker rm dynamo-sglang-thompson
-    echo "✓ Dynamo SGLang Thompson container stopped and removed"
-    STOPPED_CONTAINER=true
-fi
+    if docker ps --format '{{.Names}}' | grep -q "^dynamo-sglang-thompson$"; then
+        echo "Stopping Dynamo container (SGLang Thompson Sampling)..."
+        docker stop dynamo-sglang-thompson
+        docker rm dynamo-sglang-thompson
+        echo "✓ Dynamo SGLang Thompson container stopped and removed"
+        STOPPED_CONTAINER=true
+    fi
 
-# vLLM containers
-if docker ps --format '{{.Names}}' | grep -q "^dynamo-vllm$"; then
-    echo "Stopping Dynamo container (vLLM)..."
-    docker stop dynamo-vllm
-    docker rm dynamo-vllm
-    echo "✓ Dynamo vLLM container stopped and removed"
-    STOPPED_CONTAINER=true
-fi
+    # vLLM containers
+    if docker ps --format '{{.Names}}' | grep -q "^dynamo-vllm$"; then
+        echo "Stopping Dynamo container (vLLM)..."
+        docker stop dynamo-vllm
+        docker rm dynamo-vllm
+        echo "✓ Dynamo vLLM container stopped and removed"
+        STOPPED_CONTAINER=true
+    fi
 
-if [ "$STOPPED_CONTAINER" = false ]; then
-    echo "  (No Dynamo containers running)"
+    if [ "$STOPPED_CONTAINER" = false ]; then
+        echo "  (No Dynamo containers running)"
+    fi
 fi
 
 # Stop ETCD
@@ -150,6 +171,9 @@ fi
 echo ""
 echo "========================================================="
 echo "✓ All components stopped!"
+if [ "$KEEP_WORKERS" = true ]; then
+    echo "  (SGLang/vLLM workers left running — no model reload needed on restart)"
+fi
 if [ "$KILL_METRICS" = true ]; then
     echo "  (including monitoring stack)"
 fi

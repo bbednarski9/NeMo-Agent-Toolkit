@@ -141,7 +141,7 @@ function_groups:
 llms:
   dynamo_llm:
     _type: dynamo
-    model_name: Llama-3.3-70B-Instruct
+    model_name: Qwen3-32B
     base_url: http://localhost:8099/v1
     api_key: dummy
     temperature: 0.0
@@ -167,7 +167,7 @@ llms:
   
   eval_llm:
     _type: dynamo
-    model_name: Llama-3.3-70B-Instruct
+    model_name: Qwen3-32B
     base_url: http://localhost:8099/v1
     api_key: dummy
     temperature: 0.0

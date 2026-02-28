@@ -48,7 +48,7 @@ import pandas as pd
 from matplotlib import cm
 
 # Maximum TTFT value to display in histograms (milliseconds)
-MAX_TTFT_MS = 500
+MAX_TTFT_MS = 7_500
 # Bin width for TTFT histograms (milliseconds) - ensures good resolution in visible range
 TTFT_BIN_WIDTH_MS = 5
 
@@ -458,7 +458,7 @@ def _add_job_stats_table_compact(ax, job_stats: dict, job_labels: dict, job_colo
               columnspacing=0.3)
 
 
-def create_histogram_plots(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.DataFrame | None = None):
+def create_histogram_plots(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.DataFrame | None = None, consolidate_legend: bool = False):
     """Create histogram plots of throughput metrics distribution.
 
     Uses per-metric bin counts:
@@ -483,7 +483,7 @@ def create_histogram_plots(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.D
 
     # Group by job_name for separate histograms per job
     jobs = df['job_name'].unique() if 'job_name' in df.columns else ['default']
-    multi_job = len(jobs) > 1
+    multi_job = len(jobs) > 1 and not consolidate_legend
 
     # Create color map for jobs
     colors = cm.tab10(np.linspace(0, 1, min(len(jobs), 10)))
@@ -614,7 +614,7 @@ def create_histogram_plots(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.D
         print(f"  Saved: {output_path}")
 
     # Create a combined summary plot
-    create_summary_histogram_plot(df, output_dir, llm_call_df)
+    create_summary_histogram_plot(df, output_dir, llm_call_df, consolidate_legend=consolidate_legend)
 
     # Save the collected data as CSV
     csv_path = output_dir / 'throughput_histogram_data.csv'
@@ -628,7 +628,7 @@ def create_histogram_plots(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.D
         print(f"  Saved data: {llm_call_csv_path}")
 
 
-def create_summary_histogram_plot(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.DataFrame | None = None):
+def create_summary_histogram_plot(df: pd.DataFrame, output_dir: Path, llm_call_df: pd.DataFrame | None = None, consolidate_legend: bool = False):
     """Create a multi-panel summary histogram plot.
 
     Top row shows per-LLM-call metrics (TTFT, ITL, Throughput) if llm_call_df is provided,
@@ -648,7 +648,7 @@ def create_summary_histogram_plot(df: pd.DataFrame, output_dir: Path, llm_call_d
 
     # Group by job_name for separate histograms per job
     jobs = df['job_name'].unique() if 'job_name' in df.columns else ['default']
-    multi_job = len(jobs) > 1
+    multi_job = len(jobs) > 1 and not consolidate_legend
 
     # Create color map for jobs
     colors = cm.tab10(np.linspace(0, 1, min(len(jobs), 10)))
@@ -779,8 +779,12 @@ def create_summary_histogram_plot(df: pd.DataFrame, output_dir: Path, llm_call_d
     n_requests = len(df)
     n_llm_calls = len(llm_call_df) if has_llm_call_data else 'N/A'
     n_jobs = len(jobs)
+    if consolidate_legend:
+        domain_info = f'{n_jobs} domain{"s" if n_jobs > 1 else ""} combined'
+    else:
+        domain_info = f'{n_jobs} job{"s" if n_jobs > 1 else ""}'
     plt.suptitle(
-        f'Throughput Metrics Distribution ({n_jobs} job{"s" if n_jobs > 1 else ""})\n'
+        f'Throughput Metrics Distribution ({domain_info})\n'
         f'Top row: Per-LLM-Call ({n_llm_calls} calls, 100 bins), '
         f'Bottom row: Per-Request ({n_requests} requests, 50/25/25 bins)',
         fontsize=14,
@@ -820,6 +824,11 @@ Features:
                         type=str,
                         default=None,
                         help='Output directory for plots (default: auto-determined based on input)')
+    parser.add_argument('--consolidate-legend',
+                        action='store_true',
+                        default=False,
+                        help='Show a single aggregate stats legend entry instead of one per domain/job. '
+                        'Useful when plotting many domains where per-domain stats become unreadable.')
 
     args = parser.parse_args()
 
@@ -879,7 +888,9 @@ Features:
 
     # Create plots
     print("Creating histogram plots...")
-    create_histogram_plots(df, output_dir, llm_call_df=llm_call_df if not llm_call_df.empty else None)
+    if args.consolidate_legend:
+        print("  Legend mode: consolidated (single aggregate stats entry)")
+    create_histogram_plots(df, output_dir, llm_call_df=llm_call_df if not llm_call_df.empty else None, consolidate_legend=args.consolidate_legend)
 
     print(f"\nDone! Plots saved to: {output_dir}")
 
