@@ -79,24 +79,8 @@ to 10,000 blocks per worker.
 
 ## Architecture
 
-### kv_native (Phase 1 baseline)
-- Uses `KvRouter.generate()` from Dynamo's native Python bindings
-- Formula: `logit = overlap_weight * prefill_blocks + decode_blocks`
-- Proper `ActiveSequences` lifecycle (add on route, free on completion)
-- No learning, no session awareness
-
-### kv_thompson_native (Phase 2)
-- Thompson scoring picks the worker, `KvRouter.generate(worker_id=X)` handles lifecycle
-- **Signals used:**
-  - `get_potential_loads()`: native prefill_tokens and decode_blocks per worker
-  - `best_worker()`: native router recommendation (query-only)
-  - Session affinity: tracks last worker per prefix_id
-  - OSL / reuse_budget from request hints
-- **Learners:**
-  - BetaLearner (decay=0.995, window ~200 observations)
-  - LinTSLearner (6-feature contextual bandit, forget_rate=0.995)
-  - LatencyTracker (global EMA baseline for reward computation)
-- **Feedback:** reward = 1/(1 + metric/global_baseline), updates both learners on completion
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full architecture diagrams comparing
+the original NATS-based Thompson router with the new in-process KvRouter integration.
 
 ## Key Findings
 
