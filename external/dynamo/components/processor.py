@@ -119,6 +119,17 @@ from dynamo.llm import register_llm
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime import dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
+
+
+def _get_endpoint(runtime: DistributedRuntime, namespace: str, component: str, endpoint: str):
+    """Get a Dynamo endpoint, compatible with both old and new runtime APIs.
+
+    Old API (NGC images): runtime.namespace("ns").component("comp").endpoint("ep")
+    New API (source build): runtime.endpoint("ns.comp.ep")
+    """
+    if hasattr(runtime, "namespace"):
+        return runtime.namespace(namespace).component(component).endpoint(endpoint)
+    return runtime.endpoint(f"{namespace}.{component}.{endpoint}")
 from prometheus_client import CollectorRegistry
 from prometheus_client import Counter
 from prometheus_client import Gauge
@@ -369,7 +380,7 @@ class ProcessorRequestHandler:
     """
     Processor that receives PreprocessedRequest from the default Dynamo frontend,
     extracts routing hints from nvext annotations, and coordinates with the
-    Thompson Sampling router for intelligent worker selection.
+    Thompson Sampling router or native KvRouter for worker selection.
     """
 
     def __init__(
@@ -377,6 +388,9 @@ class ProcessorRequestHandler:
         runtime: DistributedRuntime,
         endpoint,
         enable_router: bool = True,
+        routing_mode: str = "thompson",
+        model_name: str = "",
+        kv_block_size: int = 16,
     ):
         """
         Initialize the processor request handler.
@@ -384,16 +398,30 @@ class ProcessorRequestHandler:
         Args:
             runtime: Dynamo distributed runtime for client connections.
             endpoint: Dynamo endpoint for metrics registration.
-            enable_router: Whether to use Thompson Sampling router (default: True).
+            enable_router: Whether to use any router (default: True).
+            routing_mode: "thompson" (custom router via NATS RPC) or
+                          "kv_native" (Dynamo's native KvRouter in-process).
+            model_name: Served model name (needed for KvRouter.generate()).
+            kv_block_size: KV cache block size (needed for KvRouter init).
         """
         self.runtime = runtime
         self.endpoint = endpoint
         self.enable_router = enable_router
+        self.routing_mode = routing_mode
+        self.model_name = model_name
+        self.kv_block_size = kv_block_size
 
         # Client connections (initialized in initialize())
         self.router_pick_client = None
         self.router_feedback_client = None
         self.engine_client = None
+        self.kv_router = None  # Native KvRouter (Phase 1 & 2)
+
+        # Thompson learners for kv_thompson_native mode (Phase 2)
+        self.beta_learner = None
+        self.lints_learner = None
+        self.latency_tracker = None
+        self._prefix_workers: dict[str, int] = {}  # prefix_id → last worker_id
 
         # Prefix-level state: {prefix_id: {"total": int, "processed": int}}
         self._prefix_state: dict[str, dict[str, int]] = {}
@@ -416,31 +444,61 @@ class ProcessorRequestHandler:
         overhead_log_path = os.environ.get("PROCESSOR_OVERHEAD_LOG", "/tmp/processor_overhead.jsonl")
         self._overhead_log = _setup_overhead_logger(overhead_log_path)
 
-        # Connect to Thompson Sampling router
-        if self.enable_router:
-            router_component = self.runtime.namespace("dynamo").component("router")
-            self.router_pick_client = await router_component.endpoint("find_worker").client()
-            self.router_feedback_client = await router_component.endpoint("feedback").client()
-            logger.info("Router clients created, waiting for instances...")
-            await self.router_pick_client.wait_for_instances()
-            logger.info("Router clients initialized successfully")
-
         # Connect to actual workers at workers.{component}.generate
-        # Workers are in the "workers" namespace (hidden from frontend discovery)
-        # while this processor is in "dynamo" namespace (frontend discovers us)
-        # Component name varies by backend (REQUIRED - no default):
-        #   - SGLang: uses "worker" (set via --endpoint workers.worker.generate)
-        #   - vLLM: uses "backend" (hardcoded in dynamo.vllm)
         worker_component_name = os.environ.get("DYNAMO_WORKER_COMPONENT")
         if not worker_component_name:
             raise ValueError("DYNAMO_WORKER_COMPONENT environment variable is required. "
                              "Set to 'worker' for SGLang or 'backend' for vLLM.")
-        worker_component = self.runtime.namespace("workers").component(worker_component_name)
-        self.engine_client = await worker_component.endpoint("generate").client()
+        worker_endpoint = _get_endpoint(self.runtime, "workers", worker_component_name, "generate")
+        self.engine_client = await worker_endpoint.client()
         logger.info("Engine client created for workers/%s/generate, waiting for worker instances...",
                     worker_component_name)
         await self.engine_client.wait_for_instances()
-        logger.info("Processor initialized successfully (routing to workers/%s/generate)", worker_component_name)
+        logger.info("Workers discovered: %s", list(self.engine_client.instance_ids()))
+
+        if self.enable_router and self.routing_mode in ("kv_native", "kv_thompson_native"):
+            # Use Dynamo's native KvRouter in-process.
+            try:
+                from dynamo.llm import KvRouter, KvRouterConfig
+                kv_config = KvRouterConfig()
+                self.kv_router = KvRouter(
+                    endpoint=worker_endpoint,
+                    block_size=self.kv_block_size,
+                    kv_router_config=kv_config,
+                )
+                logger.info(
+                    "Native KvRouter initialized (block_size=%d, mode=%s)",
+                    self.kv_block_size, self.routing_mode,
+                )
+            except ImportError:
+                logger.error(
+                    "KvRouter not available — requires source-built Dynamo image. "
+                    "Falling back to Thompson routing."
+                )
+                self.routing_mode = "thompson"
+
+        if self.enable_router and self.routing_mode == "kv_thompson_native":
+            # Phase 2: Thompson learners running in-process alongside KvRouter.
+            from learners import BetaLearner, LatencyTracker, LinTSLearner
+            self.beta_learner = BetaLearner(decay=0.995)
+            self.lints_learner = LinTSLearner(
+                feature_dim=6, lambda_=1.0, v=0.25, forget_rate=0.995,
+            )
+            self.latency_tracker = LatencyTracker(ema_alpha=0.2)
+            logger.info("Thompson learners initialized (beta_decay=0.995, lints_dim=6, mode=kv_thompson_native)")
+
+        if self.enable_router and self.routing_mode == "thompson":
+            # Thompson Sampling router via NATS RPC
+            router_find_ep = _get_endpoint(self.runtime, "dynamo", "router", "find_worker")
+            router_fb_ep = _get_endpoint(self.runtime, "dynamo", "router", "feedback")
+            self.router_pick_client = await router_find_ep.client()
+            self.router_feedback_client = await router_fb_ep.client()
+            logger.info("Thompson router clients created, waiting for instances...")
+            await self.router_pick_client.wait_for_instances()
+            logger.info("Thompson router clients initialized successfully")
+
+        logger.info("Processor initialized (routing_mode=%s, workers=%s/generate)",
+                    self.routing_mode, worker_component_name)
 
     # ---- annotation extraction ----
     @staticmethod
@@ -485,52 +543,74 @@ class ProcessorRequestHandler:
         except (ValueError, TypeError):
             return default
 
-    def _extract_hints(self, request: dict[str, Any]) -> tuple[str, int, str, str]:
+    def _extract_hints(self, request: dict[str, Any]) -> tuple[str, int, int, int]:
         """
-        Extract routing hints from PreprocessedRequest annotations.
+        Extract routing hints from PreprocessedRequest.
+
+        Supports two formats:
+          - Dynamo main: ``routing.expected_output_tokens``, ``routing.priority_jump``
+          - Legacy annotations: ``"osl:250"``, ``"iat:MEDIUM"``, ``"prefix_id:..."``
+
+        ``routing`` fields take precedence when present; annotations are the
+        fallback for Thompson-specific hints (prefix_id, total_requests) that
+        have no routing equivalent.
 
         Returns: (prefix_id, total_requests, osl, iat)
         """
         annotations = request.get("annotations", [])
         if not isinstance(annotations, list):
             annotations = []
+        routing = request.get("routing") or {}
+        if not isinstance(routing, dict):
+            routing = {}
 
         if annotations:
             logger.debug("Raw annotations: %s", annotations)
-        else:
-            logger.debug("No annotations in request (prefix_id will be auto-generated)")
+        if routing:
+            logger.debug("Routing hints: %s", routing)
 
-        # Extract prefix_id (generate one if not provided)
+        # --- prefix_id (annotations only, no routing equivalent) ---
         prefix_id = self._extract_annotation(annotations, "prefix_id")
         if not prefix_id:
             prefix_id = f"auto-{uuid.uuid4().hex}"
             logger.debug("No prefix_id in annotations, generated: %s", prefix_id)
 
-        # Extract total_requests count
+        # --- total_requests (annotations only) ---
         total_str = self._extract_annotation(annotations, "total_requests", "1")
         try:
             total_requests = max(1, int(total_str))
         except (ValueError, TypeError):
             total_requests = 1
 
-        # Extract expected output sequence length as a raw integer.
-        # Accepts categorical strings (LOW→128, MEDIUM→250, HIGH→1024) or raw integers.
-        # Passed directly to the router so LinTS features receive continuous values.
+        # --- osl: routing.expected_output_tokens (u32) → annotations fallback ---
         _OSL_CAT = {"LOW": 128, "MEDIUM": 250, "HIGH": 1024}
-        osl_raw = self._extract_annotation(annotations, "osl", "MEDIUM")
-        try:
-            osl: int = int(osl_raw)
-        except (ValueError, TypeError):
-            osl = _OSL_CAT.get(str(osl_raw).upper(), 250)
+        routing_osl = routing.get("expected_output_tokens")
+        if routing_osl is not None:
+            try:
+                osl: int = max(1, int(routing_osl))
+            except (ValueError, TypeError):
+                osl = 250
+        else:
+            osl_raw = self._extract_annotation(annotations, "osl", "MEDIUM")
+            try:
+                osl = int(osl_raw)
+            except (ValueError, TypeError):
+                osl = _OSL_CAT.get(str(osl_raw).upper(), 250)
 
-        # Extract interarrival time as a raw integer (milliseconds).
-        # Accepts categorical strings (LOW→50, MEDIUM→250, HIGH→1000) or raw ms values.
+        # --- iat: routing.priority_jump (seconds) → convert to ms; annotations fallback ---
         _IAT_CAT = {"LOW": 50, "MEDIUM": 250, "HIGH": 1000}
-        iat_raw = self._extract_annotation(annotations, "iat", "MEDIUM")
-        try:
-            iat: int = int(iat_raw)
-        except (ValueError, TypeError):
-            iat = _IAT_CAT.get(str(iat_raw).upper(), 250)
+        routing_iat = routing.get("priority_jump")
+        if routing_iat is not None:
+            try:
+                iat: int = max(1, int(float(routing_iat) * 1000.0))
+            except (ValueError, TypeError):
+                iat = 250
+        else:
+            iat_raw = self._extract_annotation(annotations, "iat", "MEDIUM")
+            try:
+                iat = int(iat_raw)
+            except (ValueError, TypeError):
+                iat = _IAT_CAT.get(str(iat_raw).upper(), 250)
 
         return prefix_id, total_requests, osl, iat
 
@@ -840,48 +920,198 @@ class ProcessorRequestHandler:
                 "auto" if is_auto else "annotation",
             )
 
-            # Pick worker via Thompson Sampling router (includes NATS RPC)
-            t_routing_start = time.perf_counter()
-            worker_id, decision_id = await self._pick_worker(token_ids, prefix_id, reuse_budget, osl, iat)
-            routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
+            if self.routing_mode == "kv_thompson_native" and self.kv_router is not None:
+                # ---- Thompson + Native KvRouter lifecycle (Phase 2) ----
+                import math
+                import numpy as np
 
-            # Total processor overhead up to this point (hint extraction + prefix state + routing)
-            proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
+                t_routing_start = time.perf_counter()
 
-            logger.info(
-                "Routing decision: prefix=%s worker=%s decision=%s reuse_budget=%d "
-                "routing_ms=%.1f proc_overhead_ms=%.1f",
-                prefix_id,
-                worker_id,
-                decision_id,
-                reuse_budget,
-                routing_ms,
-                proc_overhead_ms,
-            )
+                # 1. Get native load signals per worker
+                loads = await self.kv_router.get_potential_loads(token_ids)
 
-            # Write structured record to the JSON Lines overhead log.
-            # Append additional fields here as needed for future analysis.
-            if self._overhead_log is not None:
-                record = {
-                    "ts": time.time(),
-                    "prefix_id": prefix_id,
-                    "worker_id": worker_id,
-                    "decision_id": decision_id,
-                    "tokens_in": tokens_in,
-                    "osl": osl,
-                    "iat": iat,
-                    "reuse_budget": reuse_budget,
-                    "is_auto": is_auto,
-                    # Timing breakdown (all in milliseconds)
-                    "nats_rtt_ms": round(routing_ms, 2),        # NATS round-trip to router
-                    "proc_overhead_ms": round(proc_overhead_ms, 2),  # total pre-engine overhead
-                    "routing_routed": worker_id is not None,
-                }
-                self._overhead_log.info(json.dumps(record))
+                # 2. Query native router for its pick + overlap (no state update)
+                native_pick, _, overlap_blocks = await self.kv_router.best_worker(token_ids)
 
-            # Stream response from engine
-            async for resp in self._stream_from_engine(raw, worker_id, decision_id, tokens_in):
-                yield resp
+                # 3. Build per-worker scores using Thompson learners
+                worker_scores: dict[int, float] = {}
+                last_worker = self._prefix_workers.get(prefix_id)
+
+                for load_info in loads:
+                    wid = load_info["worker_id"]
+                    prefill_tokens = load_info.get("potential_prefill_tokens", 0)
+                    decode_blocks = load_info.get("potential_decode_blocks", 0)
+
+                    # Ensure learners know this worker
+                    self.beta_learner.add_worker(wid)
+                    self.lints_learner.add_worker(wid)
+
+                    # Feature vector: [bias, inv_prefill, inv_decode, affinity, osl_norm, reuse_norm]
+                    inv_prefill = 1.0 / (1.0 + prefill_tokens / 1000.0)
+                    inv_decode = 1.0 / (1.0 + decode_blocks / 50.0)
+                    affinity = 1.0 if (last_worker is not None and wid == last_worker) else 0.0
+                    osl_norm = min(osl, 1024) / 1024.0
+                    reuse_norm = math.tanh(0.25 * max(reuse_budget, 0))
+
+                    x = np.array([1.0, inv_prefill, inv_decode, affinity, osl_norm, reuse_norm],
+                                 dtype=np.float64)
+
+                    # Combined score: base (low prefill = good) + beta exploration + lints contextual
+                    base_score = inv_prefill * 0.5 + inv_decode * 0.3
+                    beta_s = 0.05 * self.beta_learner.sample(wid)
+                    lints_s = math.tanh(self.lints_learner.sample(wid, x))
+
+                    worker_scores[wid] = base_score + beta_s + lints_s
+
+                # 4. Pick best-scoring worker
+                chosen = max(worker_scores, key=worker_scores.get) if worker_scores else native_pick
+                self._prefix_workers[prefix_id] = chosen
+
+                routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
+                proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
+
+                logger.info(
+                    "ThompsonNative routing: prefix=%s chosen=%s native_pick=%s "
+                    "workers=%d routing_ms=%.1f",
+                    prefix_id, chosen, native_pick, len(worker_scores), routing_ms,
+                )
+
+                # 5. Route via KvRouter with forced worker_id (handles lifecycle)
+                stop_conditions = raw.get("stop_conditions")
+                sampling_options = raw.get("sampling_options")
+
+                stream = await self.kv_router.generate(
+                    token_ids=token_ids,
+                    model=self.model_name,
+                    stop_conditions=stop_conditions,
+                    sampling_options=sampling_options,
+                    worker_id=chosen,
+                )
+
+                # 6. Stream response and collect feedback
+                t0 = time.perf_counter()
+                tokens_out = 0
+                async for chunk in stream:
+                    if isinstance(chunk, dict):
+                        data = chunk
+                    else:
+                        data = chunk.data() if hasattr(chunk, "data") else chunk
+
+                    if "token_ids" in data and isinstance(data["token_ids"], list):
+                        tokens_out += len(data["token_ids"])
+
+                    yield data
+
+                    if "finish_reason" in data and data["finish_reason"] is not None:
+                        latency_seconds = time.perf_counter() - t0
+                        latency_ms = latency_seconds * 1000.0
+
+                        # 7. Update Thompson learners with observed reward
+                        from learners import LatencyTracker as LT
+                        metric, per_tok = LT.latency_metric(latency_ms, tokens_out)
+                        baseline = self.latency_tracker.get_global_baseline(per_tok, fallback=metric)
+                        reward = LT.compute_reward(metric, baseline, True)
+                        self.beta_learner.update(chosen, reward)
+
+                        x_chosen = np.array([1.0,
+                                             1.0 / (1.0 + prefill_tokens / 1000.0),
+                                             1.0 / (1.0 + decode_blocks / 50.0),
+                                             1.0 if last_worker == chosen else 0.0,
+                                             min(osl, 1024) / 1024.0,
+                                             math.tanh(0.25 * max(reuse_budget, 0))],
+                                            dtype=np.float64)
+                        self.lints_learner.update(chosen, x_chosen, reward)
+                        self.latency_tracker.update_baselines(chosen, "M", "L", metric, per_tok)
+
+                        self._metrics.request_latency_seconds.observe(latency_seconds)
+                        self._metrics.tokens_in_total.inc(tokens_in)
+                        self._metrics.tokens_out_total.inc(tokens_out)
+
+                        logger.debug(
+                            "ThompsonNative feedback: wid=%s metric=%.2f baseline=%.2f "
+                            "reward=%.3f tokens_out=%d",
+                            chosen, metric, baseline, reward, tokens_out,
+                        )
+                        return
+
+            elif self.routing_mode == "kv_native" and self.kv_router is not None:
+                # ---- Native KvRouter path (Phase 1 baseline) ----
+                t_routing_start = time.perf_counter()
+                stop_conditions = raw.get("stop_conditions")
+                sampling_options = raw.get("sampling_options")
+
+                stream = await self.kv_router.generate(
+                    token_ids=token_ids,
+                    model=self.model_name,
+                    stop_conditions=stop_conditions,
+                    sampling_options=sampling_options,
+                )
+                routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
+                proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
+
+                logger.info(
+                    "KvRouter routing: prefix=%s routing_ms=%.1f proc_overhead_ms=%.1f",
+                    prefix_id, routing_ms, proc_overhead_ms,
+                )
+
+                t0 = time.perf_counter()
+                tokens_out = 0
+                async for chunk in stream:
+                    if isinstance(chunk, dict):
+                        data = chunk
+                    else:
+                        data = chunk.data() if hasattr(chunk, "data") else chunk
+
+                    if "token_ids" in data and isinstance(data["token_ids"], list):
+                        tokens_out += len(data["token_ids"])
+
+                    yield data
+
+                    if "finish_reason" in data and data["finish_reason"] is not None:
+                        latency_seconds = time.perf_counter() - t0
+                        self._metrics.request_latency_seconds.observe(latency_seconds)
+                        self._metrics.tokens_in_total.inc(tokens_in)
+                        self._metrics.tokens_out_total.inc(tokens_out)
+                        return
+
+            else:
+                # ---- Thompson Sampling path (NATS RPC to custom router) ----
+                t_routing_start = time.perf_counter()
+                worker_id, decision_id = await self._pick_worker(token_ids, prefix_id, reuse_budget, osl, iat)
+                routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
+
+                proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
+
+                logger.info(
+                    "Routing decision: prefix=%s worker=%s decision=%s reuse_budget=%d "
+                    "routing_ms=%.1f proc_overhead_ms=%.1f",
+                    prefix_id,
+                    worker_id,
+                    decision_id,
+                    reuse_budget,
+                    routing_ms,
+                    proc_overhead_ms,
+                )
+
+                if self._overhead_log is not None:
+                    record = {
+                        "ts": time.time(),
+                        "prefix_id": prefix_id,
+                        "worker_id": worker_id,
+                        "decision_id": decision_id,
+                        "tokens_in": tokens_in,
+                        "osl": osl,
+                        "iat": iat,
+                        "reuse_budget": reuse_budget,
+                        "is_auto": is_auto,
+                        "nats_rtt_ms": round(routing_ms, 2),
+                        "proc_overhead_ms": round(proc_overhead_ms, 2),
+                        "routing_routed": worker_id is not None,
+                    }
+                    self._overhead_log.info(json.dumps(record))
+
+                async for resp in self._stream_from_engine(raw, worker_id, decision_id, tokens_in):
+                    yield resp
 
         finally:
             self._metrics.active_requests.dec()
@@ -895,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
         "--enable-router",
         action="store_true",
         default=True,
-        help="Enable Thompson Sampling router integration",
+        help="Enable router integration",
     )
     parser.add_argument(
         "--no-router",
@@ -935,6 +1165,21 @@ async def worker(runtime: DistributedRuntime):
     """
     args = parse_args()
 
+    # Read router_type from config.yaml to determine routing mode.
+    # "kv_native" → in-process native KvRouter; anything else → Thompson via NATS RPC.
+    config_path = os.environ.get("ROUTER_CONFIG_PATH", "/workspace/custom_dynamo/config.yaml")
+    routing_mode = "thompson"
+    try:
+        import yaml
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        router_type = config.get("infrastructure", {}).get("router_type", "kv_thompson")
+        if router_type in ("kv_native", "kv_thompson_native"):
+            routing_mode = router_type
+        logger.info("Config %s: router_type=%s → routing_mode=%s", config_path, router_type, routing_mode)
+    except Exception as e:
+        logger.warning("Could not read config at %s (%s), defaulting to thompson", config_path, e)
+
     # DYNAMIC DISCOVERY MODE:
     # Instead of using --static-endpoint on the frontend, we register a model card
     # in ETCD so the frontend can discover us via its ModelWatcher.
@@ -947,10 +1192,7 @@ async def worker(runtime: DistributedRuntime):
     #   3. Frontend's ModelWatcher discovers us and routes requests to us
     #   4. We forward to actual workers at workers.worker.generate
 
-    component = runtime.namespace("dynamo").component("backend")
-
-    # Create the endpoint FIRST (needed for register_llm and metrics)
-    endpoint = component.endpoint("generate")
+    endpoint = _get_endpoint(runtime, "dynamo", "backend", "generate")
 
     # Register the model card with ETCD so the frontend can discover us
     # We accept preprocessed tokens (ModelInput.Tokens) and serve chat/completions
@@ -976,6 +1218,9 @@ async def worker(runtime: DistributedRuntime):
         runtime=runtime,
         endpoint=endpoint,
         enable_router=args.enable_router,
+        routing_mode=routing_mode,
+        model_name=args.model_name,
+        kv_block_size=args.kv_cache_block_size,
     )
     await handler.initialize()
 

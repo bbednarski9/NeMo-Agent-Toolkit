@@ -54,6 +54,14 @@ from dynamo.runtime import DistributedRuntime
 from dynamo.runtime import dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
 
+
+def _get_endpoint(runtime: DistributedRuntime, namespace: str, component: str, endpoint: str):
+    """Compat shim: old API uses namespace().component().endpoint(), new uses endpoint("ns.comp.ep")."""
+    if hasattr(runtime, "namespace"):
+        return runtime.namespace(namespace).component(component).endpoint(endpoint)
+    return runtime.endpoint(f"{namespace}.{component}.{endpoint}")
+
+
 # KV cache overlap scoring — uses RadixTree + ZmqKvEventListener from dynamo.llm.
 # Backend-agnostic: works identically with SGLang and vLLM workers.
 # Falls back gracefully to empty scores if dynamo.llm primitives are unavailable.
@@ -725,9 +733,9 @@ class WorkloadAwareRouter:
         if not worker_component:
             raise ValueError("DYNAMO_WORKER_COMPONENT environment variable is required. "
                              "Set to 'worker' for SGLang or 'backend' for vLLM.")
-        engine = self.runtime.namespace("workers").component(worker_component)
+        engine_ep = _get_endpoint(self.runtime, "workers", worker_component, "generate")
         logger.info("Getting engine client for workers/%s/generate", worker_component)
-        self.engine_client = await engine.endpoint("generate").client()
+        self.engine_client = await engine_ep.client()
 
         min_workers = int(self.min_workers)
         if min_workers < 0:
@@ -771,7 +779,7 @@ class WorkloadAwareRouter:
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 1.5, 5.0)
 
-        self.indexer = KvIndexer(engine, self.block_size)
+        self.indexer = KvIndexer(engine_ep, self.block_size)
 
         # Start background metrics scraper (non-blocking HTTP scrapes in a daemon thread).
         discovered_worker_ids = sorted(int(w) for w in self.engine_client.instance_ids())
@@ -2069,7 +2077,6 @@ async def worker(runtime: DistributedRuntime):
     config = load_config(args.config)
     config = apply_cli_overrides(config, args)
 
-    component = runtime.namespace("dynamo").component("router")
     logger.info("Initializing Optimized Thompson Sampling Router (Prometheus metrics)")
 
     # Resolve block_size: env var KV_BLOCK_SIZE (set by startup script from
@@ -2174,9 +2181,11 @@ async def worker(runtime: DistributedRuntime):
     await router.initialize()
 
     # Serve both endpoints
+    find_worker_ep = _get_endpoint(runtime, "dynamo", "router", "find_worker")
+    feedback_ep = _get_endpoint(runtime, "dynamo", "router", "feedback")
     await asyncio.gather(
-        component.endpoint("find_worker").serve_endpoint(router.generate),
-        component.endpoint("feedback").serve_endpoint(router.feedback),
+        find_worker_ep.serve_endpoint(router.generate),
+        feedback_ep.serve_endpoint(router.feedback),
     )
 
 

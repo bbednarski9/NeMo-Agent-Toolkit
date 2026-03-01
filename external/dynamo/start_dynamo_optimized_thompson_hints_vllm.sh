@@ -106,7 +106,7 @@ if [ "${DYNAMO_FROM_SOURCE:-false}" = "true" ]; then
         exit 1
     fi
     IMAGE="${DYNAMO_IMAGE}"
-    DYNAMO_USE_MULTILRU="true"
+    DYNAMO_USE_MULTILRU="${DYNAMO_USE_MULTILRU:-false}"
 
     # Verify the image exists; offer build instructions if not
     if ! docker image inspect "${IMAGE}" > /dev/null 2>&1; then
@@ -510,7 +510,7 @@ docker run -d \
   -e ENABLE_KV_EVENTS=$ENABLE_KV_EVENTS \
   -e KV_EVENT_BASE_PORT=$KV_EVENT_BASE_PORT \
   -e DYNAMO_USE_MULTILRU=$DYNAMO_USE_MULTILRU \
-  -e DYNAMO_WORKER_COMPONENT=backend \
+  -e DYNAMO_WORKER_COMPONENT=${DYNAMO_WORKER_COMPONENT:-backend} \
   -e PROCESSOR_OVERHEAD_LOG=/workspace/logs/processor_overhead.jsonl \
   $IMAGE \
   bash -c "
@@ -593,9 +593,14 @@ docker run -d \
 
         echo \"\"
         echo \"Waiting for ALL \$expected_count vLLM workers to register with ETCD...\"
-        echo \"  Detection: Count workers at workers.backend.generate endpoint\"
+        local wc_name=\"\${DYNAMO_WORKER_COMPONENT:-backend}\"
+        echo \"  Detection: Count workers at workers.\${wc_name}.generate endpoint\"
         echo \"  Timeout: \${max_wait}s\"
         echo \"\"
+
+        # Generate base64 ETCD key range for the worker component
+        local etcd_key=\$(echo -n \"v1/instances/workers/\${wc_name}/generate/\" | base64 -w0)
+        local etcd_range_end=\$(echo -n \"v1/instances/workers/\${wc_name}/generate0\" | base64 -w0)
 
         while [ \$elapsed -lt \$max_wait ]; do
             # Check all worker PIDs are still alive
@@ -607,13 +612,12 @@ docker run -d \
             done
 
             # Count worker registrations in ETCD
-            # Workers register with keys like: v1/instances/workers/backend/generate/<instance_id>
             local worker_count=\$(curl -s --max-time 2 http://localhost:2379/v3/kv/range \
                 -X POST \
                 -H \"Content-Type: application/json\" \
                 -d '{
-                    \"key\": \"'\"djEvaW5zdGFuY2VzL3dvcmtlcnMvYmFja2VuZC9nZW5lcmF0ZS8=\"'\",
-                    \"range_end\": \"'\"djEvaW5zdGFuY2VzL3dvcmtlcnMvYmFja2VuZC9nZW5lcmF0ZTA=\"'\",
+                    \"key\": \"'\"\$etcd_key\"'\",
+                    \"range_end\": \"'\"\$etcd_range_end\"'\",
                     \"count_only\": true
                 }' 2>/dev/null | grep -o '\"count\":\"[^\"]*\"' | grep -o '[0-9]*' || echo \"0\")
 

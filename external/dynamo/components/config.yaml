@@ -20,7 +20,7 @@
 # Infrastructure settings
 infrastructure:
   block_size: 16          # KV cache block size — must match DYNAMO_KV_BLOCK_SIZE in .env (env var overrides this)
-  router_type: kv_thompson  # "kv" (full Thompson), "kv_only" (pure KV overlap), "kv_load_balanced" (KV + load), "kv_thompson" (KV + load + Beta-TS), "kv_load" (Dynamo-native formula)
+  router_type: kv_thompson_native  # "kv_native" (native baseline), "kv_thompson_native" (Thompson+native lifecycle), "kv_thompson" (NATS RPC), "kv_load" (legacy replica)
   min_workers: 1          # Minimum workers required before routing starts
 
 # Affinity settings - controls stickiness to same worker for prefix reuse
@@ -82,7 +82,7 @@ feedback:
 kv_load:
   overlap_score_weight: 1.0   # Weight for KV overlap in logit (higher = prefer cached workers)
   temperature: 0.0            # Softmax temperature (0 = deterministic, matches Dynamo default)
-  metrics_scrape_interval: 0.1  # Seconds between worker metrics scrapes (lower = more responsive routing)
+  metrics_scrape_interval: 0.01  # Seconds between worker metrics scrapes (lower = more responsive routing)
 
 # KV Load Balanced mode - same Dynamo formula as kv_load but with:
 #   - idle_boost: idle workers get a minimum overlap credit to reduce prefill penalty
@@ -91,7 +91,7 @@ kv_load_balanced:
   overlap_score_weight: 1.0   # Weight for KV overlap in logit (higher = prefer cached workers)
   idle_boost: 0.02          # Minimum effective overlap for idle workers (allows them to steal traffic)
   temperature: 0.15         # Softmax temperature (lower = more greedy, higher = more spread)
-  metrics_scrape_interval: 0.1  # Seconds between worker metrics scrapes (lower = more responsive routing)
+  metrics_scrape_interval: 0.01  # Seconds between worker metrics scrapes (lower = more responsive routing)
 
 # KV Thompson mode — modular scoring with togglable features
 #
@@ -162,7 +162,7 @@ kv_thompson:
   switch_base: 0.04            # Base switching penalty. Absorbed former switch_iat (0.01×1.0) for same reason.
   switch_reuse: 0.01           # Additional penalty per remaining request (was 0.04)
   sticky_load_floor: 0.01      # Minimum load_mod for sticky worker (enable_sticky_floor)
-  load_mod_floor: 0.1          # Global minimum load_mod for ALL workers. Prevents KV overlap signal
+  load_mod_floor: 0.3          # Global minimum load_mod for ALL workers. Prevents KV overlap signal
                                # from being erased when all workers have deep queues (load_mod≈0).
                                # At floor=0.1: overlap=0.95 still scores 5x higher than overlap=0.20
                                # even at queue depth 50+. Set to 0 to disable (original behavior).
