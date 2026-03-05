@@ -24,6 +24,8 @@ from typing import Any
 import optuna
 import yaml
 
+import urllib.request
+
 from nat.data_models.config import Config
 from nat.data_models.evaluate_runtime import EvaluationRunConfig
 from nat.data_models.optimizable import SearchSpace
@@ -40,6 +42,65 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 """Optional eval runtime class."""
+
+# Mapping from NAT config field names to router management API field names
+_ROUTER_PARAM_MAP = {
+    "router_ts_weight": "ts_weight",
+    "router_temperature": "temperature",
+    "router_cold_start_threshold": "cold_start_threshold",
+    "router_idle_boost": "idle_boost",
+    "router_beta_decay": "beta_decay",
+    "router_lints_v": "lints_v",
+    "router_lints_forget_rate": "lints_forget_rate",
+}
+
+
+def _push_router_config_and_reset(mgmt_url: str, suggestions: dict[str, Any]) -> None:
+    """Push router tuning params and reset learner state before an optimization trial.
+
+    Calls POST /state/reset then POST /config on the router/processor management
+    endpoint.  Silently logs warnings on failure (the optimizer continues).
+    """
+    import json as _json
+
+    router_params = {}
+    for nat_key, api_key in _ROUTER_PARAM_MAP.items():
+        for sug_key, sug_val in suggestions.items():
+            if sug_key.endswith(nat_key):
+                router_params[api_key] = sug_val
+
+    if not router_params:
+        return
+
+    # 1. Reset learner state to pristine
+    try:
+        req = urllib.request.Request(f"{mgmt_url}/state/reset", method="POST",
+                                     data=b"", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info("Router learner state reset: %s", resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to reset router state at %s: %s", mgmt_url, e)
+
+    # 2. Push new config values
+    try:
+        payload = _json.dumps(router_params).encode()
+        req = urllib.request.Request(f"{mgmt_url}/config", method="POST",
+                                     data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info("Router config pushed: %s → %s", router_params, resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to push router config to %s: %s", mgmt_url, e)
+
+
+def _find_router_management_url(cfg: Config) -> str | None:
+    """Extract router_management_url from any LLM config in the Config tree."""
+    if not hasattr(cfg, 'llms') or cfg.llms is None:
+        return None
+    for llm_cfg in cfg.llms.values():
+        url = getattr(llm_cfg, 'router_management_url', None)
+        if url:
+            return url.rstrip("/")
+    return None
 
 
 def _on_numeric_trial_end(
@@ -172,7 +233,7 @@ def optimize_parameters(
         async def _single_eval(trial_idx: int) -> tuple[list[float], Any]:  # noqa: ARG001
             eval_cfg = EvaluationRunConfig(
                 config_file=cfg_trial,
-                dataset=opt_run_config.dataset,
+                dataset=str(opt_run_config.dataset) if opt_run_config.dataset else None,
                 result_json_path=opt_run_config.result_json_path,
                 endpoint=opt_run_config.endpoint,
                 endpoint_timeout=opt_run_config.endpoint_timeout,
@@ -184,6 +245,11 @@ def optimize_parameters(
                 values.append(metric.average_score)
 
             return values, eval_output
+
+        # Push router tuning params and reset learner state before eval
+        mgmt_url = _find_router_management_url(base_cfg)
+        if mgmt_url:
+            _push_router_config_and_reset(mgmt_url, suggestions)
 
         # Create tasks for all evaluations
         async def _run_all_evals():

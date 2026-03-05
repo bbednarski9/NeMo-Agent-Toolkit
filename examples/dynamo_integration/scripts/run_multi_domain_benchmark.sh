@@ -21,6 +21,7 @@
 #
 # Usage:
 #   bash run_multi_domain_benchmark.sh [--config-dir <path>] [--concurrency <n>]
+#   bash run_multi_domain_benchmark.sh --configs a.yml b.yml c.yml [--concurrency <n>]
 #
 # Default concurrency: 4 per config
 
@@ -32,6 +33,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Defaults
 CONCURRENCY=4
 CONFIG_DIR="$REPO_ROOT/examples/dynamo_integration/react_benchmark_agent/configs/multi_domain"
+EXPLICIT_CONFIGS=()   # If set via --configs, skip the config-dir discovery entirely
 
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
@@ -44,25 +46,46 @@ while [[ $# -gt 0 ]]; do
             CONCURRENCY="$2"
             shift 2
             ;;
+        --configs)
+            shift
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                EXPLICIT_CONFIGS+=("$1")
+                shift
+            done
+            ;;
         *)
             echo "Unknown argument: $1"
             echo "Usage: $0 [--config-dir <path>] [--concurrency <n>]"
+            echo "       $0 --configs a.yml b.yml c.yml [--concurrency <n>]"
             exit 1
             ;;
     esac
 done
 
-# Resolve config dir relative to repo root if not absolute
-if [[ "$CONFIG_DIR" != /* ]]; then
-    CONFIG_DIR="$REPO_ROOT/$CONFIG_DIR"
-fi
-
 DOMAINS="banking healthcare insurance investment telecom"
 
-# ── Shuffle domain order, then shuffle variants within each domain ────────────
-# Produces a flat list of config paths: all variants of domain[0] (shuffled),
-# then all variants of domain[1] (shuffled), etc., with domains themselves shuffled.
-SHUFFLED_CONFIGS=$(python3 -c "
+if [[ ${#EXPLICIT_CONFIGS[@]} -gt 0 ]]; then
+    # ── Explicit config list — use as-is, resolving relative paths ───────────
+    ALL_CONFIGS=()
+    for cfg in "${EXPLICIT_CONFIGS[@]}"; do
+        if [[ "$cfg" != /* ]]; then
+            cfg="$REPO_ROOT/$cfg"
+        fi
+        if [[ ! -f "$cfg" ]]; then
+            echo "ERROR: Config not found: $cfg"
+            exit 1
+        fi
+        ALL_CONFIGS+=("$cfg")
+    done
+    # Derive CONFIG_DIR from the first config for display purposes
+    CONFIG_DIR="$(dirname "${ALL_CONFIGS[0]}")"
+else
+    # ── Config-dir discovery — shuffle domains and variants ──────────────────
+    if [[ "$CONFIG_DIR" != /* ]]; then
+        CONFIG_DIR="$REPO_ROOT/$CONFIG_DIR"
+    fi
+
+    SHUFFLED_CONFIGS=$(python3 -c "
 import sys, random, glob, os
 
 domains = '$DOMAINS'.split()
@@ -81,8 +104,9 @@ for domain in domains:
 print('\n'.join(result))
 ")
 
-# Convert to array
-mapfile -t ALL_CONFIGS <<< "$SHUFFLED_CONFIGS"
+    mapfile -t ALL_CONFIGS <<< "$SHUFFLED_CONFIGS"
+fi
+
 N_CONFIGS=${#ALL_CONFIGS[@]}
 
 echo "========================================================="

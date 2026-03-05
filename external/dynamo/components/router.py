@@ -50,6 +50,7 @@ from typing import Any
 import numpy as np
 import uvloop
 import yaml
+from aiohttp import web
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime import dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
@@ -2070,6 +2071,116 @@ See PARAMETERS.md for full parameter documentation.
     return parser.parse_args()
 
 
+# -------------------------- learner management HTTP server -------------- #
+
+class RouterManagementServer:
+    """Lightweight HTTP server for router learner state, config, and reset.
+
+    Runs alongside the main NATS endpoints on a separate port (default 8085).
+    """
+
+    def __init__(self, router: WorkloadAwareRouter, config_path: str, port: int = 8085):
+        self._router = router
+        self._config_path = config_path
+        self._port = port
+        self._runner: web.AppRunner | None = None
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_get("/health", self._health)
+        app.router.add_get("/state", self._get_state)
+        app.router.add_post("/state", self._load_state)
+        app.router.add_post("/state/reset", self._reset_state)
+        app.router.add_get("/config", self._get_config)
+        app.router.add_post("/config", self._set_config)
+
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "0.0.0.0", self._port)
+        await site.start()
+        logger.info("Router management HTTP server listening on :%d", self._port)
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+    async def _health(self, _request: web.Request) -> web.Response:
+        r = self._router
+        return web.json_response({
+            "status": "ok",
+            "router_type": r.router_type,
+            "workers": r.beta_learner.worker_ids,
+        })
+
+    async def _get_state(self, _request: web.Request) -> web.Response:
+        r = self._router
+        return web.json_response({
+            "beta_learner": r.beta_learner.to_dict(),
+            "lints_learner": r.lints_learner.to_dict(),
+        })
+
+    async def _load_state(self, request: web.Request) -> web.Response:
+        r = self._router
+        data = await request.json()
+        if "beta_learner" in data:
+            r.beta_learner.load_state(data["beta_learner"])
+        if "lints_learner" in data:
+            r.lints_learner.load_state(data["lints_learner"])
+        logger.info("Router learner state loaded via HTTP")
+        return web.json_response({"status": "loaded"})
+
+    async def _reset_state(self, _request: web.Request) -> web.Response:
+        r = self._router
+        r.beta_learner.reset_all()
+        r.lints_learner.reset_all()
+        r.latency_tracker.reset()
+        logger.info("Router learner state reset to pristine via HTTP")
+        return web.json_response({"status": "reset"})
+
+    async def _get_config(self, _request: web.Request) -> web.Response:
+        r = self._router
+        return web.json_response({
+            "ts_weight": r.kv_ts_weight,
+            "temperature": r.kv_load_temp,
+            "cold_start_threshold": r.kv_thompson_cold_start,
+            "idle_boost": r.idle_boost,
+            "beta_decay": r.beta_learner.decay,
+            "lints_v": r.lints_learner.v,
+            "lints_forget_rate": r.lints_learner.forget_rate,
+        })
+
+    async def _set_config(self, request: web.Request) -> web.Response:
+        """Hot-reload tunable router params on the live WorkloadAwareRouter instance."""
+        data = await request.json()
+        r = self._router
+        applied = {}
+
+        if "ts_weight" in data:
+            r.kv_ts_weight = float(data["ts_weight"])
+            applied["ts_weight"] = r.kv_ts_weight
+        if "temperature" in data:
+            r.kv_load_temp = float(data["temperature"])
+            applied["temperature"] = r.kv_load_temp
+        if "cold_start_threshold" in data:
+            r.kv_thompson_cold_start = float(data["cold_start_threshold"])
+            applied["cold_start_threshold"] = r.kv_thompson_cold_start
+        if "idle_boost" in data:
+            r.idle_boost = float(data["idle_boost"])
+            applied["idle_boost"] = r.idle_boost
+        if "beta_decay" in data:
+            r.beta_learner.decay = float(data["beta_decay"])
+            applied["beta_decay"] = r.beta_learner.decay
+        if "lints_v" in data:
+            r.lints_learner.v = float(data["lints_v"])
+            applied["lints_v"] = r.lints_learner.v
+        if "lints_forget_rate" in data:
+            r.lints_learner.forget_rate = float(data["lints_forget_rate"])
+            applied["lints_forget_rate"] = r.lints_learner.forget_rate
+
+        logger.info("Router config hot-reloaded via HTTP: %s", applied)
+        return web.json_response({"status": "applied", "params": applied})
+
+
 @dynamo_worker()
 async def worker(runtime: DistributedRuntime):
     # Parse CLI and load config
@@ -2179,6 +2290,12 @@ async def worker(runtime: DistributedRuntime):
         debug_buffer_size=get_nested(config, "debug.buffer_size", 2000),
     )
     await router.initialize()
+
+    # Start learner management HTTP server
+    mgmt_port = int(os.environ.get("ROUTER_MGMT_PORT", "8085"))
+    config_path = args.config or str(get_default_config_path())
+    mgmt_server = RouterManagementServer(router, config_path=config_path, port=mgmt_port)
+    await mgmt_server.start()
 
     # Serve both endpoints
     find_worker_ep = _get_endpoint(runtime, "dynamo", "router", "find_worker")

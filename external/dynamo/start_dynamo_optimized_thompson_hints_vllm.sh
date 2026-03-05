@@ -494,6 +494,8 @@ docker run -d \
   -v $LOCAL_MODEL_DIR:$MODEL:ro \
   -v $CUSTOM_DYNAMO_DIR:/workspace/custom_dynamo:ro \
   -v ${SCRIPT_DIR}/monitoring/scripts:/workspace/monitoring/scripts:ro \
+  -v "${SCRIPT_DIR}/logs:/workspace/logs" \
+  -e REPLAY_LOG_DIR="${REPLAY_LOG_DIR:-}" \
   -v $LOGS_HOST_DIR:/workspace/logs \
   -e HF_TOKEN="$HF_TOKEN" \
   -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \

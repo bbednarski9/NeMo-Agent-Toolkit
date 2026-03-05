@@ -176,22 +176,13 @@ def extract_per_request_tsq_scores(job_dir: Path) -> dict[int, dict] | None:
 
         scores_by_example = {}
         for idx, item in enumerate(eval_items):
-            # Extract example number from id like "banking_scenario_000"
             item_id = item.get("id", f"example_{idx}")
             score = item.get("score", 0.0)
             reasoning = item.get("reasoning", {})
 
-            # Try to parse example number from id
-            example_num = idx  # Default to index if can't parse
-            if "_" in item_id:
-                try:
-                    # Handle formats like "banking_scenario_000"
-                    num_str = item_id.split("_")[-1]
-                    example_num = int(num_str)
-                except (ValueError, IndexError):
-                    pass
-
-            scores_by_example[example_num] = {"id": item_id, "score": score, "reasoning": reasoning}
+            # Use sequential index to match the CSV's example_number column,
+            # which is assigned by profiler processing order (not scenario ID).
+            scores_by_example[idx] = {"id": item_id, "score": score, "reasoning": reasoning}
 
         return scores_by_example
 

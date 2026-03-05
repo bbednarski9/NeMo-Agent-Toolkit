@@ -429,6 +429,8 @@ docker run -d \
   --ulimit stack=67108864 \
   -v $LOCAL_MODEL_DIR:$MODEL:ro \
   -v $CUSTOM_DYNAMO_DIR:/workspace/custom_dynamo:ro \
+  -v "${SCRIPT_DIR}/logs:/workspace/logs" \
+  -e REPLAY_LOG_DIR="${REPLAY_LOG_DIR:-}" \
   -e HF_TOKEN="$HF_TOKEN" \
   -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
   -e RUST_BACKTRACE=1 \

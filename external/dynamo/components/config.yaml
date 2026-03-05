@@ -20,6 +20,7 @@
 # Infrastructure settings
 infrastructure:
   block_size: 16          # KV cache block size — must match DYNAMO_KV_BLOCK_SIZE in .env (env var overrides this)
+  # router_type: kv_native  # "kv_native" (native baseline), "kv_thompson_native" (Thompson+native lifecycle), "kv_thompson" (NATS RPC), "kv_load" (legacy replica)
   router_type: kv_thompson_native  # "kv_native" (native baseline), "kv_thompson_native" (Thompson+native lifecycle), "kv_thompson" (NATS RPC), "kv_load" (legacy replica)
   min_workers: 1          # Minimum workers required before routing starts
 
@@ -33,7 +34,7 @@ affinity:
 # Exploration settings - controls explore vs exploit tradeoff
 exploration:
   base_ts_weight: 0.10    # Weight for Thompson Sampling exploration term
-  beta_decay: 0.995       # Exponential decay for Beta bandit (1.0 = no forgetting, 0.995 = window ≈ 200 obs, half-life ≈ 138)
+  beta_decay: 0.98        # Exponential decay for Beta bandit (0.98 = window ≈ 50 obs, half-life ≈ 34)
   temperature:
     base: 1.0             # Base softmax temperature (CLI: --temp-base)
     min: 0.15             # Minimum temperature (more greedy)
@@ -61,8 +62,8 @@ prefill:
 # LinTS (Linear Thompson Sampling) learner parameters
 lints:
   lambda: 1.0             # Ridge regression regularization strength
-  v: 0.25                 # Exploration variance in posterior sampling (CLI: --lints-v)
-  forget_rate: 0.995      # Exponential decay for old observations (0.995 = slow forget)
+  v: 0.06                 # Exploration variance in posterior sampling (CLI: --lints-v)
+  forget_rate: 0.99       # Exponential decay for old observations (0.99 = moderate forget)
 
 # Feedback handling - delayed reward processing
 feedback:
@@ -140,11 +141,11 @@ kv_load_balanced:
 #
 kv_thompson:
   # --- Base parameters (always active) ---
-  ts_weight: 0.05              # Weight of Beta-TS exploration term (range: 0..1, higher = more exploration)
-  idle_boost: 0.02             # Floor overlap for idle workers (prevents starvation; 0 = no boost)
-  temperature: 0.30            # Softmax temperature for selection (lower = greedier, higher = more spread)
+  ts_weight: 0.13              # Weight of Beta-TS exploration term (range: 0..1, higher = more exploration)
+  idle_boost: 0.135            # Floor overlap for idle workers (prevents starvation; 0 = no boost)
+  temperature: 1.70            # Softmax temperature for selection (lower = greedier, higher = more spread)
   queue_penalty_weight: 2.5   # Exponential queue penalty: load_mod = exp(-qpw * queue² / 25). Controls severity at queue=5 (the "knee").
-  cold_start_threshold: 0.05   # Min overlap to trust scoring (below = round-robin; 0 = never round-robin)
+  cold_start_threshold: 0.37   # Min overlap to trust scoring (below = round-robin; 0 = never round-robin)
   metrics_scrape_interval: 0.01 # Seconds between worker metrics scrapes (lower = more responsive)
   # --- Feature toggles (false = off, true = on) ---
   enable_lints: true          # LinTS contextual bandit (ISL/OSL-aware exploration)

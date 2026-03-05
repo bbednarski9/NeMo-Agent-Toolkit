@@ -347,6 +347,73 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
         description="HTTP request timeout in seconds for LLM requests.",
     )
 
+    # =========================================================================
+    # ROUTER TUNING PARAMETERS (pushed to router via HTTP management endpoint)
+    # =========================================================================
+
+    router_management_url: str | None = Field(
+        default=None,
+        description="URL of the router/processor learner management HTTP server "
+        "(e.g. http://localhost:8084). When set, the optimizer pushes router "
+        "tuning params and resets learner state before each trial.",
+    )
+
+    router_ts_weight: float = OptimizableField(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Beta-TS exploration weight in the Thompson Sampling router.",
+        space=SearchSpace(low=0.01, high=0.20, step=0.02),
+    )
+
+    router_temperature: float = OptimizableField(
+        default=0.30,
+        ge=0.01,
+        le=5.0,
+        description="Softmax temperature for worker selection (lower = greedier).",
+        space=SearchSpace(low=0.10, high=2.00, step=0.10),
+    )
+
+    router_cold_start_threshold: float = OptimizableField(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Minimum KV overlap to trust scoring (below = round-robin).",
+        space=SearchSpace(low=0.01, high=0.40, step=0.02),
+    )
+
+    router_idle_boost: float = OptimizableField(
+        default=0.02,
+        ge=0.0,
+        le=1.0,
+        description="Floor overlap for idle workers (prevents starvation).",
+        space=SearchSpace(low=0.005, high=0.20, step=0.01),
+    )
+
+    router_beta_decay: float = OptimizableField(
+        default=0.995,
+        ge=0.9,
+        le=1.0,
+        description="Beta learner exponential decay (0.98=window~50, 1.0=no forget).",
+        space=SearchSpace(low=0.950, high=1.000, step=0.005),
+    )
+
+    router_lints_v: float = OptimizableField(
+        default=0.25,
+        ge=0.01,
+        le=5.0,
+        description="LinTS posterior exploration variance.",
+        space=SearchSpace(low=0.01, high=1.00, step=0.05),
+    )
+
+    router_lints_forget_rate: float = OptimizableField(
+        default=0.995,
+        ge=0.9,
+        le=1.0,
+        description="LinTS exponential forgetting rate (lower = faster adaptation).",
+        space=SearchSpace(low=0.950, high=0.999, step=0.005),
+    )
+
     nvext_prediction_trie_path: str | None = Field(
         default=None,
         description="Path to prediction_trie.json file. When set, predictions are "
@@ -443,6 +510,14 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
             "nvext_cache_pin_type",
             "nvext_cache_control_mode",
             "nvext_max_sensitivity",
+            "router_management_url",
+            "router_ts_weight",
+            "router_temperature",
+            "router_cold_start_threshold",
+            "router_idle_boost",
+            "router_beta_decay",
+            "router_lints_v",
+            "router_lints_forget_rate",
         })
 
 
@@ -536,9 +611,9 @@ class _DynamoTransport(httpx.AsyncBaseTransport):
 
                 if prediction:
                     # Override with prediction-derived values
-                    total_requests = int(prediction.remaining_calls.mean)
-                    osl_raw = int(prediction.output_tokens.p90)
-                    iat_raw = int(prediction.interarrival_ms.mean)
+                    total_requests = max(1, int(prediction.remaining_calls.mean))
+                    osl_raw = max(1, int(prediction.output_tokens.p90))
+                    iat_raw = max(1, int(prediction.interarrival_ms.mean))
 
                     # Auto-assign latency sensitivity from profiler data
                     # Only if prediction has it AND no manual @latency_sensitive decorator is active

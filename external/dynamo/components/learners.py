@@ -130,6 +130,45 @@ class BetaLearner:
             return float("inf")
         return 1.0 / (1.0 - self.decay)
 
+    # -- serialization --
+
+    def reset_all(self) -> None:
+        """Reset all known workers to the uninformative prior (alpha=1, beta=1)."""
+        with self._lock:
+            for wid in list(self._bandits):
+                self._bandits[wid] = (1.0, 1.0)
+
+    def to_dict(self) -> dict:
+        """Serialize learner state to a JSON-compatible dict."""
+        with self._lock:
+            bandits = {str(wid): list(ab) for wid, ab in self._bandits.items()}
+        return {
+            "type": "BetaLearner",
+            "decay": self.decay,
+            "min_pseudo_count": self.min_pseudo_count,
+            "bandits": bandits,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BetaLearner":
+        """Restore a BetaLearner from a dict produced by ``to_dict``."""
+        learner = cls(
+            decay=data.get("decay", 1.0),
+            min_pseudo_count=data.get("min_pseudo_count", 1.0),
+        )
+        for wid_str, ab in data.get("bandits", {}).items():
+            learner._bandits[int(wid_str)] = (float(ab[0]), float(ab[1]))
+        return learner
+
+    def load_state(self, data: dict) -> None:
+        """Load bandit state in-place from a dict (preserves object identity)."""
+        with self._lock:
+            self.decay = float(data.get("decay", self.decay))
+            self.min_pseudo_count = float(data.get("min_pseudo_count", self.min_pseudo_count))
+            self._bandits.clear()
+            for wid_str, ab in data.get("bandits", {}).items():
+                self._bandits[int(wid_str)] = (float(ab[0]), float(ab[1]))
+
 
 # ---------------------------------------------------------------------------
 # LinTSLearner
@@ -269,6 +308,60 @@ class LinTSLearner:
         except np.linalg.LinAlgError:
             return np.zeros(self.feature_dim, dtype=np.float64)
 
+    # -- serialization --
+
+    def reset_all(self) -> None:
+        """Reset all known workers to the uninformative prior (A=lambda*I, b=0)."""
+        with self._lock:
+            for wid in list(self._A):
+                self._A[wid] = self.lambda_ * np.eye(self.feature_dim, dtype=np.float64)
+                self._b[wid] = np.zeros(self.feature_dim, dtype=np.float64)
+
+    def to_dict(self) -> dict:
+        """Serialize learner state to a JSON-compatible dict."""
+        with self._lock:
+            workers = {}
+            for wid in self._A:
+                workers[str(wid)] = {
+                    "A": self._A[wid].tolist(),
+                    "b": self._b[wid].tolist(),
+                }
+        return {
+            "type": "LinTSLearner",
+            "feature_dim": self.feature_dim,
+            "lambda": self.lambda_,
+            "v": self.v,
+            "forget_rate": self.forget_rate,
+            "workers": workers,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LinTSLearner":
+        """Restore a LinTSLearner from a dict produced by ``to_dict``."""
+        learner = cls(
+            feature_dim=data.get("feature_dim", 9),
+            lambda_=data.get("lambda", 1.0),
+            v=data.get("v", 0.25),
+            forget_rate=data.get("forget_rate", 0.995),
+        )
+        for wid_str, state in data.get("workers", {}).items():
+            wid = int(wid_str)
+            learner._A[wid] = np.array(state["A"], dtype=np.float64)
+            learner._b[wid] = np.array(state["b"], dtype=np.float64)
+        return learner
+
+    def load_state(self, data: dict) -> None:
+        """Load learner state in-place from a dict (preserves object identity)."""
+        with self._lock:
+            self.v = float(data.get("v", self.v))
+            self.forget_rate = float(data.get("forget_rate", self.forget_rate))
+            self._A.clear()
+            self._b.clear()
+            for wid_str, state in data.get("workers", {}).items():
+                wid = int(wid_str)
+                self._A[wid] = np.array(state["A"], dtype=np.float64)
+                self._b[wid] = np.array(state["b"], dtype=np.float64)
+
 
 # ---------------------------------------------------------------------------
 # LatencyTracker
@@ -342,6 +435,12 @@ class LatencyTracker:
         key_b = (wid, osl, prefill_bin, per_tok)
         self._bucket[key_b] = self._ema(self._bucket.get(key_b), metric)
         return self._bucket[key_b]
+
+    def reset(self) -> None:
+        """Clear all EMA baselines back to initial state."""
+        self._global = {False: None, True: None}
+        self._worker.clear()
+        self._bucket.clear()
 
     @staticmethod
     def latency_metric(latency_ms: float, tokens_out: int | None) -> tuple[float, bool]:

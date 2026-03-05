@@ -47,6 +47,24 @@ class AverageTokensPerLLMEndConfig(EvaluatorBaseConfig, name="avg_tokens_per_llm
     max_concurrency: int = Field(default=8, description="Max concurrency for evaluation.")
 
 
+class AverageTTFTConfig(EvaluatorBaseConfig, name="avg_ttft"):
+    """Average Time to First Token per LLM call (seconds, lower is better)."""
+
+    max_concurrency: int = Field(default=8, description="Max concurrency for evaluation.")
+
+
+class AverageTPSConfig(EvaluatorBaseConfig, name="avg_tps"):
+    """Average Tokens Per Second per LLM call (higher is better)."""
+
+    max_concurrency: int = Field(default=8, description="Max concurrency for evaluation.")
+
+
+class AverageITLConfig(EvaluatorBaseConfig, name="avg_itl"):
+    """Average Inter-Token Latency per LLM call (seconds, lower is better)."""
+
+    max_concurrency: int = Field(default=8, description="Max concurrency for evaluation.")
+
+
 @register_evaluator(config_type=AverageLLMLatencyConfig)
 async def register_avg_llm_latency_evaluator(config: AverageLLMLatencyConfig, builder: EvalBuilder):
     from .evaluate import AverageLLMLatencyEvaluator
@@ -98,3 +116,42 @@ async def register_avg_tokens_per_llm_end_evaluator(config: AverageTokensPerLLME
     yield EvaluatorInfo(config=config,
                         evaluate_fn=evaluate_fn,
                         description="Average total tokens per LLM_END (prompt + completion)")
+
+
+@register_evaluator(config_type=AverageTTFTConfig)
+async def register_avg_ttft_evaluator(config: AverageTTFTConfig, builder: EvalBuilder):
+    from .streaming_evaluate import AverageTTFTEvaluator
+
+    evaluator = AverageTTFTEvaluator(max_concurrency=config.max_concurrency or builder.get_max_concurrency())
+
+    async def evaluate_fn(eval_input: EvalInput) -> EvalOutput:
+        return await evaluator.evaluate(eval_input)
+
+    yield EvaluatorInfo(config=config, evaluate_fn=evaluate_fn,
+                        description="Average Time to First Token (s) from LLM_START to first LLM_NEW_TOKEN")
+
+
+@register_evaluator(config_type=AverageTPSConfig)
+async def register_avg_tps_evaluator(config: AverageTPSConfig, builder: EvalBuilder):
+    from .streaming_evaluate import AverageTPSEvaluator
+
+    evaluator = AverageTPSEvaluator(max_concurrency=config.max_concurrency or builder.get_max_concurrency())
+
+    async def evaluate_fn(eval_input: EvalInput) -> EvalOutput:
+        return await evaluator.evaluate(eval_input)
+
+    yield EvaluatorInfo(config=config, evaluate_fn=evaluate_fn,
+                        description="Average Tokens Per Second (completion_tokens / duration)")
+
+
+@register_evaluator(config_type=AverageITLConfig)
+async def register_avg_itl_evaluator(config: AverageITLConfig, builder: EvalBuilder):
+    from .streaming_evaluate import AverageITLEvaluator
+
+    evaluator = AverageITLEvaluator(max_concurrency=config.max_concurrency or builder.get_max_concurrency())
+
+    async def evaluate_fn(eval_input: EvalInput) -> EvalOutput:
+        return await evaluator.evaluate(eval_input)
+
+    yield EvaluatorInfo(config=config, evaluate_fn=evaluate_fn,
+                        description="Average Inter-Token Latency (s) between consecutive LLM_NEW_TOKEN events")

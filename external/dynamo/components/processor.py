@@ -113,6 +113,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import uvloop
+from aiohttp import web
 from dynamo.llm import ModelInput
 from dynamo.llm import ModelType
 from dynamo.llm import register_llm
@@ -434,6 +435,9 @@ class ProcessorRequestHandler:
         self._metrics: ProcessorMetrics | None = None
         self._overhead_log: logging.Logger | None = None
 
+        # Replay logger for post-hoc routing analysis (initialized in initialize())
+        self._replay_logger = None  # type: ReplayLogger | None
+
     async def initialize(self):
         """Initialize processor by setting up metrics and connecting to services."""
         # Initialize metrics using Dynamo's metrics API
@@ -499,6 +503,33 @@ class ProcessorRequestHandler:
 
         logger.info("Processor initialized (routing_mode=%s, workers=%s/generate)",
                     self.routing_mode, worker_component_name)
+
+        hint_overrides = {
+            k: os.environ[k]
+            for k in ("HINT_OVERRIDE_OSL", "HINT_OVERRIDE_IAT",
+                       "HINT_OVERRIDE_TOTAL_REQUESTS", "HINT_OVERRIDE_PREFIX_ID")
+            if k in os.environ
+        }
+        if hint_overrides:
+            logger.warning("Hint overrides ACTIVE — extracted agent_hints will be clamped: %s", hint_overrides)
+        else:
+            logger.info("No HINT_OVERRIDE_* env vars set; agent_hints pass through unchanged")
+
+        replay_dir = os.environ.get("REPLAY_LOG_DIR")
+        if replay_dir:
+            from datetime import datetime, timezone
+
+            from replay_logger import ReplayLogger
+            run_id = f"{self.routing_mode}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+            self._replay_logger = ReplayLogger(
+                output_dir=replay_dir,
+                run_id=run_id,
+                router_type=self.routing_mode,
+                config={
+                    "block_size": self.kv_block_size,
+                    "num_workers": len(list(self.engine_client.instance_ids())),
+                },
+            )
 
     # ---- annotation extraction ----
     @staticmethod
@@ -611,6 +642,22 @@ class ProcessorRequestHandler:
                 iat = int(iat_raw)
             except (ValueError, TypeError):
                 iat = _IAT_CAT.get(str(iat_raw).upper(), 250)
+
+        # Apply env-var hint overrides for A/B testing.
+        # When set, these clamp extracted hints to fixed neutral values so
+        # the Thompson router receives no useful signal from that dimension.
+        env_osl = os.environ.get("HINT_OVERRIDE_OSL")
+        if env_osl is not None:
+            osl = int(env_osl)
+        env_iat = os.environ.get("HINT_OVERRIDE_IAT")
+        if env_iat is not None:
+            iat = int(env_iat)
+        env_total = os.environ.get("HINT_OVERRIDE_TOTAL_REQUESTS")
+        if env_total is not None:
+            total_requests = max(1, int(env_total))
+        env_prefix = os.environ.get("HINT_OVERRIDE_PREFIX_ID")
+        if env_prefix and env_prefix.lower() == "auto":
+            prefix_id = f"auto-{uuid.uuid4().hex}"
 
         return prefix_id, total_requests, osl, iat
 
@@ -935,12 +982,16 @@ class ProcessorRequestHandler:
 
                 # 3. Build per-worker scores using Thompson learners
                 worker_scores: dict[int, float] = {}
+                loads_by_wid: dict[int, dict] = {}
+                features_by_wid: dict[int, np.ndarray] = {}
                 last_worker = self._prefix_workers.get(prefix_id)
+                replay_workers: list[dict] = []
 
                 for load_info in loads:
                     wid = load_info["worker_id"]
                     prefill_tokens = load_info.get("potential_prefill_tokens", 0)
                     decode_blocks = load_info.get("potential_decode_blocks", 0)
+                    loads_by_wid[wid] = load_info
 
                     # Ensure learners know this worker
                     self.beta_learner.add_worker(wid)
@@ -955,17 +1006,57 @@ class ProcessorRequestHandler:
 
                     x = np.array([1.0, inv_prefill, inv_decode, affinity, osl_norm, reuse_norm],
                                  dtype=np.float64)
+                    features_by_wid[wid] = x
 
                     # Combined score: base (low prefill = good) + beta exploration + lints contextual
                     base_score = inv_prefill * 0.5 + inv_decode * 0.3
-                    beta_s = 0.05 * self.beta_learner.sample(wid)
+                    beta_raw = self.beta_learner.sample(wid)
+                    beta_s = 0.05 * beta_raw
                     lints_s = math.tanh(self.lints_learner.sample(wid, x))
 
                     worker_scores[wid] = base_score + beta_s + lints_s
 
+                    if self._replay_logger is not None:
+                        replay_workers.append({
+                            "id": wid,
+                            "kv_overlap": round(1.0 - prefill_tokens / max(1, tokens_in), 4),
+                            "prefill_tokens": prefill_tokens,
+                            "decode_blocks": decode_blocks,
+                            "beta_sample": round(beta_raw, 4),
+                            "lints_sample": round(lints_s, 4),
+                            "final_score": round(worker_scores[wid], 4),
+                        })
+
                 # 4. Pick best-scoring worker
                 chosen = max(worker_scores, key=worker_scores.get) if worker_scores else native_pick
                 self._prefix_workers[prefix_id] = chosen
+
+                # Replay decision log
+                decision_id = None
+                if self._replay_logger is not None:
+                    decision_id = str(uuid.uuid4())
+                    session_depth = total_requests - reuse_budget
+                    chosen_x = features_by_wid.get(chosen)
+                    self._replay_logger.log_decision({
+                        "event": "route",
+                        "decision_id": decision_id,
+                        "run_id": self._replay_logger.run_id,
+                        "session_id": prefix_id,
+                        "llm_call_idx": session_depth - 1,
+                        "session_depth": session_depth,
+                        "timestamp_ns": time.time_ns(),
+                        "chosen_worker": chosen,
+                        "native_recommendation": native_pick,
+                        "overrode_native": chosen != native_pick,
+                        "features": {
+                            "inv_prefill": round(float(chosen_x[1]), 4),
+                            "inv_decode": round(float(chosen_x[2]), 4),
+                            "affinity": float(chosen_x[3]),
+                            "osl_norm": round(float(chosen_x[4]), 4),
+                            "reuse_norm": round(float(chosen_x[5]), 4),
+                        } if chosen_x is not None else None,
+                        "workers": replay_workers,
+                    })
 
                 routing_ms = (time.perf_counter() - t_routing_start) * 1000.0
                 proc_overhead_ms = (time.perf_counter() - t_proc_start) * 1000.0
@@ -990,6 +1081,7 @@ class ProcessorRequestHandler:
 
                 # 6. Stream response and collect feedback
                 t0 = time.perf_counter()
+                t_first_token = None
                 tokens_out = 0
                 async for chunk in stream:
                     if isinstance(chunk, dict):
@@ -998,6 +1090,8 @@ class ProcessorRequestHandler:
                         data = chunk.data() if hasattr(chunk, "data") else chunk
 
                     if "token_ids" in data and isinstance(data["token_ids"], list):
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
                         tokens_out += len(data["token_ids"])
 
                     yield data
@@ -1013,19 +1107,48 @@ class ProcessorRequestHandler:
                         reward = LT.compute_reward(metric, baseline, True)
                         self.beta_learner.update(chosen, reward)
 
-                        x_chosen = np.array([1.0,
-                                             1.0 / (1.0 + prefill_tokens / 1000.0),
-                                             1.0 / (1.0 + decode_blocks / 50.0),
-                                             1.0 if last_worker == chosen else 0.0,
-                                             min(osl, 1024) / 1024.0,
-                                             math.tanh(0.25 * max(reuse_budget, 0))],
-                                            dtype=np.float64)
+                        x_chosen = features_by_wid.get(chosen)
+                        if x_chosen is None:
+                            chosen_load = loads_by_wid.get(chosen, {})
+                            x_chosen = np.array([
+                                1.0,
+                                1.0 / (1.0 + chosen_load.get("potential_prefill_tokens", 0) / 1000.0),
+                                1.0 / (1.0 + chosen_load.get("potential_decode_blocks", 0) / 50.0),
+                                1.0 if last_worker == chosen else 0.0,
+                                min(osl, 1024) / 1024.0,
+                                math.tanh(0.25 * max(reuse_budget, 0)),
+                            ], dtype=np.float64)
                         self.lints_learner.update(chosen, x_chosen, reward)
                         self.latency_tracker.update_baselines(chosen, "M", "L", metric, per_tok)
 
                         self._metrics.request_latency_seconds.observe(latency_seconds)
                         self._metrics.tokens_in_total.inc(tokens_in)
                         self._metrics.tokens_out_total.inc(tokens_out)
+
+                        if self._replay_logger is not None and decision_id is not None:
+                            ttft_ms = ((t_first_token - t0) * 1000.0) if t_first_token else latency_ms
+                            itl_ms = ((latency_ms - ttft_ms) / max(1, tokens_out - 1)) if tokens_out > 1 else 0.0
+                            beta_alpha, beta_beta = self.beta_learner.get_params(chosen)
+                            lints_mean = self.lints_learner.posterior_mean(chosen).tolist()
+                            self._replay_logger.log_feedback({
+                                "event": "feedback",
+                                "decision_id": decision_id,
+                                "run_id": self._replay_logger.run_id,
+                                "session_id": prefix_id,
+                                "chosen_worker": chosen,
+                                "ttft_ms": round(ttft_ms, 2),
+                                "tokens_out": tokens_out,
+                                "itl_ms": round(itl_ms, 2),
+                                "duration_ms": round(latency_ms, 2),
+                                "metric": round(metric, 4),
+                                "baseline_ema": round(baseline, 4),
+                                "reward": round(reward, 4),
+                                "beta_after": {
+                                    "alpha": round(beta_alpha, 4),
+                                    "beta": round(beta_beta, 4),
+                                },
+                                "lints_posterior_mean": [round(v, 6) for v in lints_mean],
+                            })
 
                         logger.debug(
                             "ThompsonNative feedback: wid=%s metric=%.2f baseline=%.2f "
@@ -1039,6 +1162,40 @@ class ProcessorRequestHandler:
                 t_routing_start = time.perf_counter()
                 stop_conditions = raw.get("stop_conditions")
                 sampling_options = raw.get("sampling_options")
+
+                native_decision_id = None
+                native_chosen = None
+
+                if self._replay_logger is not None:
+                    native_loads = await self.kv_router.get_potential_loads(token_ids)
+                    native_chosen, _, native_overlap = await self.kv_router.best_worker(token_ids)
+                    native_decision_id = str(uuid.uuid4())
+                    session_depth = total_requests - reuse_budget
+                    native_worker_details = [{
+                        "id": li["worker_id"],
+                        "kv_overlap": round(
+                            1.0 - li.get("potential_prefill_tokens", 0) / max(1, tokens_in), 4,
+                        ),
+                        "prefill_tokens": li.get("potential_prefill_tokens", 0),
+                        "decode_blocks": li.get("potential_decode_blocks", 0),
+                        "beta_sample": None,
+                        "lints_sample": None,
+                        "final_score": None,
+                    } for li in native_loads]
+                    self._replay_logger.log_decision({
+                        "event": "route",
+                        "decision_id": native_decision_id,
+                        "run_id": self._replay_logger.run_id,
+                        "session_id": prefix_id,
+                        "llm_call_idx": session_depth - 1,
+                        "session_depth": session_depth,
+                        "timestamp_ns": time.time_ns(),
+                        "chosen_worker": native_chosen,
+                        "native_recommendation": native_chosen,
+                        "overrode_native": False,
+                        "features": None,
+                        "workers": native_worker_details,
+                    })
 
                 stream = await self.kv_router.generate(
                     token_ids=token_ids,
@@ -1055,6 +1212,7 @@ class ProcessorRequestHandler:
                 )
 
                 t0 = time.perf_counter()
+                t_first_token = None
                 tokens_out = 0
                 async for chunk in stream:
                     if isinstance(chunk, dict):
@@ -1063,6 +1221,8 @@ class ProcessorRequestHandler:
                         data = chunk.data() if hasattr(chunk, "data") else chunk
 
                     if "token_ids" in data and isinstance(data["token_ids"], list):
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
                         tokens_out += len(data["token_ids"])
 
                     yield data
@@ -1072,6 +1232,30 @@ class ProcessorRequestHandler:
                         self._metrics.request_latency_seconds.observe(latency_seconds)
                         self._metrics.tokens_in_total.inc(tokens_in)
                         self._metrics.tokens_out_total.inc(tokens_out)
+
+                        if self._replay_logger is not None and native_decision_id is not None:
+                            latency_ms = latency_seconds * 1000.0
+                            ttft_ms = ((t_first_token - t0) * 1000.0) if t_first_token else latency_ms
+                            itl_ms = ((latency_ms - ttft_ms) / max(1, tokens_out - 1)) if tokens_out > 1 else 0.0
+                            from learners import LatencyTracker as LT
+                            fb_metric, _ = LT.latency_metric(latency_ms, tokens_out)
+                            self._replay_logger.log_feedback({
+                                "event": "feedback",
+                                "decision_id": native_decision_id,
+                                "run_id": self._replay_logger.run_id,
+                                "session_id": prefix_id,
+                                "chosen_worker": native_chosen,
+                                "ttft_ms": round(ttft_ms, 2),
+                                "tokens_out": tokens_out,
+                                "itl_ms": round(itl_ms, 2),
+                                "duration_ms": round(latency_ms, 2),
+                                "metric": round(fb_metric, 4),
+                                "baseline_ema": None,
+                                "reward": None,
+                                "beta_after": None,
+                                "lints_posterior_mean": None,
+                            })
+
                         return
 
             else:
@@ -1115,6 +1299,162 @@ class ProcessorRequestHandler:
 
         finally:
             self._metrics.active_requests.dec()
+
+
+# -------------------------- learner management HTTP server -------------- #
+
+TUNABLE_ROUTER_PARAMS = [
+    "ts_weight", "temperature", "cold_start_threshold", "idle_boost",
+    "beta_decay", "lints_v", "lints_forget_rate",
+]
+
+
+class LearnerManagementServer:
+    """Lightweight HTTP server for learner state, config, and reset management.
+
+    Runs alongside the main NATS endpoint on a separate port (default 8084).
+    Only functional when routing_mode is kv_thompson_native (in-process learners).
+    """
+
+    def __init__(self, handler: ProcessorRequestHandler, port: int = 8084):
+        self._handler = handler
+        self._port = port
+        self._runner: web.AppRunner | None = None
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_get("/health", self._health)
+        app.router.add_get("/state", self._get_state)
+        app.router.add_post("/state", self._load_state)
+        app.router.add_post("/state/reset", self._reset_state)
+        app.router.add_get("/config", self._get_config)
+        app.router.add_post("/config", self._set_config)
+
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "0.0.0.0", self._port)
+        await site.start()
+        logger.info("Learner management HTTP server listening on :%d", self._port)
+
+    async def stop(self) -> None:
+        if self._runner:
+            await self._runner.cleanup()
+
+    async def _health(self, _request: web.Request) -> web.Response:
+        h = self._handler
+        return web.json_response({
+            "status": "ok",
+            "routing_mode": h.routing_mode,
+            "has_learners": h.beta_learner is not None,
+        })
+
+    async def _get_state(self, _request: web.Request) -> web.Response:
+        h = self._handler
+        if h.beta_learner is None or h.lints_learner is None:
+            return web.json_response({"error": "no in-process learners (not kv_thompson_native)"}, status=400)
+        return web.json_response({
+            "beta_learner": h.beta_learner.to_dict(),
+            "lints_learner": h.lints_learner.to_dict(),
+        })
+
+    async def _load_state(self, request: web.Request) -> web.Response:
+        h = self._handler
+        if h.beta_learner is None or h.lints_learner is None:
+            return web.json_response({"error": "no in-process learners"}, status=400)
+        data = await request.json()
+        if "beta_learner" in data:
+            h.beta_learner.load_state(data["beta_learner"])
+        if "lints_learner" in data:
+            h.lints_learner.load_state(data["lints_learner"])
+        logger.info("Learner state loaded via HTTP")
+        return web.json_response({"status": "loaded"})
+
+    async def _reset_state(self, _request: web.Request) -> web.Response:
+        h = self._handler
+        if h.beta_learner is None or h.lints_learner is None:
+            return web.json_response({"error": "no in-process learners"}, status=400)
+        h.beta_learner.reset_all()
+        h.lints_learner.reset_all()
+        if h.latency_tracker is not None:
+            h.latency_tracker.reset()
+        logger.info("Learner state reset to pristine via HTTP")
+        return web.json_response({"status": "reset"})
+
+    async def _get_config(self, _request: web.Request) -> web.Response:
+        """Return current values of the tunable router params (read from config_path)."""
+        config_path = os.environ.get("ROUTER_CONFIG_PATH", "/workspace/custom_dynamo/config.yaml")
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            kt = cfg.get("kv_thompson", {})
+            lints = cfg.get("lints", {})
+            exploration = cfg.get("exploration", {})
+            result = {
+                "ts_weight": kt.get("ts_weight"),
+                "temperature": kt.get("temperature"),
+                "cold_start_threshold": kt.get("cold_start_threshold"),
+                "idle_boost": kt.get("idle_boost"),
+                "beta_decay": exploration.get("beta_decay"),
+                "lints_v": lints.get("v"),
+                "lints_forget_rate": lints.get("forget_rate"),
+            }
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _set_config(self, request: web.Request) -> web.Response:
+        """Hot-reload router tuning params into config.yaml and live learner instances."""
+        data = await request.json()
+        h = self._handler
+
+        config_path = os.environ.get("ROUTER_CONFIG_PATH", "/workspace/custom_dynamo/config.yaml")
+        try:
+            import yaml
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+
+            kt = cfg.setdefault("kv_thompson", {})
+            lints = cfg.setdefault("lints", {})
+            exploration = cfg.setdefault("exploration", {})
+            applied = {}
+
+            if "ts_weight" in data:
+                kt["ts_weight"] = float(data["ts_weight"])
+                applied["ts_weight"] = kt["ts_weight"]
+            if "temperature" in data:
+                kt["temperature"] = float(data["temperature"])
+                applied["temperature"] = kt["temperature"]
+            if "cold_start_threshold" in data:
+                kt["cold_start_threshold"] = float(data["cold_start_threshold"])
+                applied["cold_start_threshold"] = kt["cold_start_threshold"]
+            if "idle_boost" in data:
+                kt["idle_boost"] = float(data["idle_boost"])
+                applied["idle_boost"] = kt["idle_boost"]
+            if "beta_decay" in data:
+                exploration["beta_decay"] = float(data["beta_decay"])
+                applied["beta_decay"] = exploration["beta_decay"]
+                if h.beta_learner is not None:
+                    h.beta_learner.decay = float(data["beta_decay"])
+            if "lints_v" in data:
+                lints["v"] = float(data["lints_v"])
+                applied["lints_v"] = lints["v"]
+                if h.lints_learner is not None:
+                    h.lints_learner.v = float(data["lints_v"])
+            if "lints_forget_rate" in data:
+                lints["forget_rate"] = float(data["lints_forget_rate"])
+                applied["lints_forget_rate"] = lints["forget_rate"]
+                if h.lints_learner is not None:
+                    h.lints_learner.forget_rate = float(data["lints_forget_rate"])
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, default_flow_style=False)
+
+            logger.info("Router config hot-reloaded via HTTP: %s", applied)
+            return web.json_response({"status": "applied", "params": applied})
+        except Exception as e:
+            logger.error("Failed to hot-reload config: %s", e)
+            return web.json_response({"error": str(e)}, status=500)
 
 
 # -------------------------- worker entry point -------------------------- #
@@ -1223,6 +1563,11 @@ async def worker(runtime: DistributedRuntime):
         kv_block_size=args.kv_cache_block_size,
     )
     await handler.initialize()
+
+    # Start learner management HTTP server (for state persistence, config hot-reload, reset)
+    mgmt_port = int(os.environ.get("LEARNER_STATE_PORT", "8084"))
+    mgmt_server = LearnerManagementServer(handler, port=mgmt_port)
+    await mgmt_server.start()
 
     # Serve as "backend.generate" - frontend will route to us after ETCD discovery
     await endpoint.serve_endpoint(handler.generate)

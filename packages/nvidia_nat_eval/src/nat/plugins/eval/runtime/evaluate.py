@@ -239,11 +239,8 @@ class EvaluationRun:
                             # raise original error
                             raise
                         except Exception as e:
-                            logger.exception("Failed to run the workflow: %s", e)
-                            # stop processing if a workflow error occurs
-                            self.workflow_interrupted = True
+                            logger.exception("Failed to run the workflow for item %s: %s", item.id, e)
                             await cancel_pending_tasks()
-                            stop_event.set()
                             return
 
                         try:
@@ -276,8 +273,12 @@ class EvaluationRun:
                 if root_span_token is not None:
                     ctx_state._root_span_id.reset(root_span_token)
 
+        scenario_concurrency = self.eval_config.general.max_concurrency
+        semaphore = asyncio.Semaphore(scenario_concurrency)
+
         async def wrapped_run(item: EvalInputItem) -> None:
-            await run_one(item)
+            async with semaphore:
+                await run_one(item)
             pbar.update(1)
 
         # if self.config.skip_complete is set skip eval_input_items with a non-empty output_obj
