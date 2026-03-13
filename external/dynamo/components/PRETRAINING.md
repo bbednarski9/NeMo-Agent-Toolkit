@@ -210,6 +210,8 @@ metrics.
 | `router_beta_decay` | 0.995 | [0.950, 1.000] | Beta learner exponential decay |
 | `router_lints_v` | 0.25 | [0.01, 1.00] | LinTS posterior exploration variance |
 | `router_lints_forget_rate` | 0.995 | [0.950, 0.999] | LinTS exponential forgetting rate |
+| `router_queue_penalty_weight` | 2.5 | [0.50, 5.00] | Exponential queue penalty strength |
+| `router_lints_weight` | -1.0 | [-2.00, 2.00] | LinTS contribution weight (negative = tanh-bounded) |
 
 ### Run
 

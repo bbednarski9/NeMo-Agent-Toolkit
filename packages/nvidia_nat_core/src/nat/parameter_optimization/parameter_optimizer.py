@@ -52,6 +52,8 @@ _ROUTER_PARAM_MAP = {
     "router_beta_decay": "beta_decay",
     "router_lints_v": "lints_v",
     "router_lints_forget_rate": "lints_forget_rate",
+    "router_queue_penalty_weight": "queue_penalty_weight",
+    "router_lints_weight": "lints_weight",
 }
 
 

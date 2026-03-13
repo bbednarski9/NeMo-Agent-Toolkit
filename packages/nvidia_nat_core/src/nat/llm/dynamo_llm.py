@@ -414,6 +414,24 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
         space=SearchSpace(low=0.950, high=0.999, step=0.005),
     )
 
+    router_queue_penalty_weight: float = OptimizableField(
+        default=2.5,
+        ge=0.0,
+        le=10.0,
+        description="Exponential queue penalty: load_mod = exp(-qpw * decode_blocks² / 2500). "
+        "Higher values penalize loaded workers more aggressively.",
+        space=SearchSpace(low=0.5, high=5.0, step=0.25),
+    )
+
+    router_lints_weight: float = OptimizableField(
+        default=-1.0,
+        ge=-5.0,
+        le=5.0,
+        description="LinTS contribution weight. Negative = tanh-bounded [-1,1], positive = raw. "
+        "Controls how much the contextual bandit influences worker selection.",
+        space=SearchSpace(low=-2.0, high=2.0, step=0.25),
+    )
+
     nvext_prediction_trie_path: str | None = Field(
         default=None,
         description="Path to prediction_trie.json file. When set, predictions are "
@@ -518,6 +536,8 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
             "router_beta_decay",
             "router_lints_v",
             "router_lints_forget_rate",
+            "router_queue_penalty_weight",
+            "router_lints_weight",
         })
 
 

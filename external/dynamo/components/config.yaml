@@ -1,177 +1,84 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Thompson Sampling Router Configuration
-# ======================================
+# KvThompsonRouter Configuration
+# ===============================
 #
-# This file contains all configurable parameters for the WorkloadAwareRouter.
-# Parameters can be overridden via CLI flags (see PARAMETERS.md for details).
+# All routing parameters are under the `kv_thompson:` key.
+# The router reads this file at startup and exposes hot-reload via POST /config.
 #
 # REQUIRED ENVIRONMENT VARIABLE:
 #   DYNAMO_WORKER_COMPONENT - Component name where backend workers register.
 #     - SGLang: "worker" (workers register at workers.worker.generate)
-#     - vLLM:   "backend" (workers register at workers.backend.generate)
-#
-# CLI Override Examples:
-#   python router.py --config config.yaml --affinity-base 0.5
-#   python router.py --config config.yaml --override affinity.reuse_weight=0.2
+#     - vLLM:   "worker" or "backend" (depends on Dynamo image version)
 #
 
 # Infrastructure settings
 infrastructure:
   block_size: 16          # KV cache block size — must match DYNAMO_KV_BLOCK_SIZE in .env (env var overrides this)
-  # router_type: kv_native  # "kv_native" (native baseline), "kv_thompson_native" (Thompson+native lifecycle), "kv_thompson" (NATS RPC), "kv_load" (legacy replica)
-  router_type: kv_thompson_native  # "kv_native" (native baseline), "kv_thompson_native" (Thompson+native lifecycle), "kv_thompson" (NATS RPC), "kv_load" (legacy replica)
+  router_type: kv_thompson  # "kv_native" (native baseline), "kv_thompson" (Thompson+native lifecycle)
+  # router_type: kv_thompson  # "kv_native" (native baseline), "kv_thompson" (Thompson+native lifecycle)
   min_workers: 1          # Minimum workers required before routing starts
 
-# Affinity settings - controls stickiness to same worker for prefix reuse
-affinity:
-  base: 0.30              # Base affinity bonus when staying on same worker (CLI: --affinity-base)
-  reuse_weight: 0.08      # Additional bonus per remaining request in session (was 0.15 — caused runaway stickiness with reuse_after=8+)
-  iat_weight: 0.20        # Bonus scaling based on inter-arrival time
-  sticky_load_floor: 0.01 # Minimum load modifier for sticky decisions (was 0.25 — still 10x above real load_mod=0.023 at queue=28, blocking all switches)
-
-# Exploration settings - controls explore vs exploit tradeoff
-exploration:
-  base_ts_weight: 0.10    # Weight for Thompson Sampling exploration term
-  beta_decay: 0.98        # Exponential decay for Beta bandit (0.98 = window ≈ 50 obs, half-life ≈ 34)
-  temperature:
-    base: 1.0             # Base softmax temperature (CLI: --temp-base)
-    min: 0.15             # Minimum temperature (more greedy)
-    max: 2.0              # Maximum temperature (more random)
-
-# Switching cost - penalty for moving prefix to different worker
-switching_cost:
-  base: 0.10              # Base penalty for switching workers (was 0.20 — too costly to escape overloaded worker)
-  reuse_penalty: 0.04     # Additional penalty per remaining request (was 0.08)
-  iat_penalty: 0.03       # Additional penalty based on inter-arrival time (was 0.05)
-
-# Load balancing - how much to penalize busy workers
-load_balancing:
-  queue_penalty_weight: 1.50        # Weight for queue depth penalty (was 0.50 — queue depth is the strongest overload signal)
-  gpu_penalty_weight: 1.00          # Weight for GPU memory usage penalty
-  outstanding_work_weight: 0.45     # Weight for outstanding work penalty
-  job_gpu_coupling_weight: 0.40     # Coupling between job cost and GPU load
-  job_queue_coupling_weight: 0.20   # Coupling between job cost and queue depth
-
-# Prefill cost model - how to weight input sequence length
-prefill:
-  token_scale: 1024.0     # Normalization scale for token count
-  weight: 1.0             # Weight of prefill cost in total job cost
-
-# LinTS (Linear Thompson Sampling) learner parameters
-lints:
-  lambda: 1.0             # Ridge regression regularization strength
-  v: 0.06                 # Exploration variance in posterior sampling (CLI: --lints-v)
-  forget_rate: 0.99       # Exponential decay for old observations (0.99 = moderate forget)
-
-# Feedback handling - delayed reward processing
-feedback:
-  timeout_seconds: 120.0          # Seconds to wait for feedback before timeout penalty
-  sweep_interval_seconds: 5.0     # How often to check for timed-out decisions
-  timeout_reward: 0.0             # Reward assigned to timed-out decisions (0.0 = bad)
-  latency_ema_alpha: 0.2          # EMA smoothing factor for latency baselines
-  reward_baseline_mode: global    # Baseline for reward computation: "global" (recommended — shared
-                                  # across workers, enables differentiation), "hierarchical" (legacy —
-                                  # per-worker baselines, equalizes rewards), "blended" (70/30 mix)
-
-# KV Load mode — replicates Dynamo's native DefaultWorkerSelector formula:
-#   logit = overlap_weight * potential_prefill_blocks + decode_blocks
-# Lower logit = better worker (less prefill work + less decode load).
-# temperature=0.0 is deterministic (lowest logit wins, tree-size tiebreaker).
-# temperature>0.0 uses negative-logit softmax sampling.
-kv_load:
-  overlap_score_weight: 1.0   # Weight for KV overlap in logit (higher = prefer cached workers)
-  temperature: 0.0            # Softmax temperature (0 = deterministic, matches Dynamo default)
-  metrics_scrape_interval: 0.01  # Seconds between worker metrics scrapes (lower = more responsive routing)
-
-# KV Load Balanced mode - same Dynamo formula as kv_load but with:
-#   - idle_boost: idle workers get a minimum overlap credit to reduce prefill penalty
-#   - softmax selection with temperature instead of deterministic argmin
-kv_load_balanced:
-  overlap_score_weight: 1.0   # Weight for KV overlap in logit (higher = prefer cached workers)
-  idle_boost: 0.02          # Minimum effective overlap for idle workers (allows them to steal traffic)
-  temperature: 0.15         # Softmax temperature (lower = more greedy, higher = more spread)
-  metrics_scrape_interval: 0.01  # Seconds between worker metrics scrapes (lower = more responsive routing)
-
-# KV Thompson mode — modular scoring with togglable features
+# KvThompsonRouter — all parameters consolidated here
 #
-# Base scoring (always on):
-#   effective_overlap = max(overlap, idle_boost)
-#   load_mod          = 1 / (1 + queue_penalty_weight * queue_depth)       [simple mode]
-#   ts_sample         ~ Beta(alpha_w, beta_w)       [per-worker, learned from feedback]
-#   score             = effective_overlap * load_mod + ts_weight * ts_sample
-#
-# Optional features (each independently togglable):
-#
-#   enable_lints — contextual bandit (ISL/OSL-aware exploration):
-#     score += lints_weight * LinTS(wid, feature_vector)
-#     feature_vector = [1, inv_load, overlap, affinity, outstanding, decode_norm, prefill_norm, iat_norm, reuse_norm]
-#
-#   enable_affinity — prefix stickiness (prefer same worker for multi-turn sessions):
-#     if same_worker and reuse_after > 0:
-#       score += (affinity_base + affinity_reuse_weight * reuse_after + affinity_iat_weight * iat) * (0.5 + 0.5 * overlap)
-#
-#   enable_switching_cost — penalty for migrating a prefix to a different worker:
-#     if different_worker and reuse_after > 0:
-#       score -= (switch_base + switch_reuse * reuse_after + switch_iat * iat)
-#
-#   enable_full_load — 5-parameter load model (replaces simple queue-only load_mod):
-#     load_mod = 1 / (1 + gpu_w * gpu + queue_w * queue + outstanding_w * work
-#                       + job_gpu_w * job_cost * gpu + job_queue_w * job_cost * queue)
-#
-#   enable_adaptive_temp — temperature decays with reuse (greedier late in session):
-#     temperature = temp_base / (1 + reuse_after * iat_factor)
-#
-#   enable_adaptive_explore — Beta-TS weight decays with reuse (less exploration late in session):
-#     ts_weight_eff = ts_weight / (1 + reuse_after * iat_factor)
-#
-#   enable_sticky_floor — protect sticky worker's load_mod from dropping too low:
-#     if same_worker and reuse_after > 0: load_mod = max(load_mod, sticky_load_floor)
+# Scoring formula:
+#   effective_overlap = max(overlap, idle_boost)              [if enable_idle_boost]
+#   load_mod = exp(-queue_penalty_weight * decode_blocks² / 2500)
+#   score = effective_overlap * load_mod
+#         + ts_weight * Beta(wid)                             [adaptive decay if enable_adaptive_explore]
+#         + lints_weight * tanh(LinTS(wid, x))                [if enable_lints]
+#         + affinity_bonus * load_mod                         [if enable_affinity]
+#         - switching_penalty                                 [if enable_switching_cost]
 #
 # Selection:
-#   if max(overlap) < cold_start_threshold → round-robin (bypass scoring)
-#   else → softmax(scores, temperature) → probabilistic pick
-#
-# Feedback learning (applied to chosen worker after latency observed):
-#   reward  = 1 / (1 + latency_metric / baseline_ema)
-#   alpha_w += reward          (good latency → higher future samples)
-#   beta_w  += (1 - reward)    (bad latency → lower future samples)
-#   LinTS:  A_w = forget * A_w + x * x^T;  b_w = forget * b_w + x * reward
+#   enable_cold_start → round-robin when max overlap < cold_start_threshold
+#   enable_softmax    → softmax(scores, temperature) → probabilistic pick
+#   else              → deterministic argmax
 #
 kv_thompson:
-  # --- Base parameters (always active) ---
-  ts_weight: 0.13              # Weight of Beta-TS exploration term (range: 0..1, higher = more exploration)
-  idle_boost: 0.135            # Floor overlap for idle workers (prevents starvation; 0 = no boost)
-  temperature: 1.70            # Softmax temperature for selection (lower = greedier, higher = more spread)
-  queue_penalty_weight: 2.5   # Exponential queue penalty: load_mod = exp(-qpw * queue² / 25). Controls severity at queue=5 (the "knee").
-  cold_start_threshold: 0.37   # Min overlap to trust scoring (below = round-robin; 0 = never round-robin)
-  metrics_scrape_interval: 0.01 # Seconds between worker metrics scrapes (lower = more responsive)
+
+  # --- Learner hyperparameters ---
+  beta_decay: 0.995             # Exponential decay for Beta bandit (0.995 = window ≈ 200 obs)
+  lints_lambda: 1.0             # LinTS ridge regression regularization strength
+  lints_v: 0.25                 # LinTS exploration variance in posterior sampling
+  lints_forget_rate: 0.995      # LinTS exponential decay (0.995 = window ≈ 200)
+  latency_ema_alpha: 0.2        # EMA smoothing factor for latency reward baselines
+
+  # --- Base scoring parameters ---
+  ts_weight: 0.05               # Weight of Beta-TS exploration term (range: 0..1, higher = more exploration)
+  idle_boost: 0.135             # Floor overlap for idle workers (prevents starvation; 0 = no boost)
+  temperature: 1.70             # Softmax temperature for selection (lower = greedier, higher = more spread)
+  temp_min: 0.15                # Minimum temperature clamp (most greedy)
+  temp_max: 2.0                 # Maximum temperature clamp (most random)
+  queue_penalty_weight: 2.5     # Exponential queue penalty: load_mod = exp(-qpw * db² / 2500) [optimizable: 0.5..5.0]
+  cold_start_threshold: 0.37    # Min overlap to trust scoring (below = round-robin; 0 = never round-robin)
+  load_mod_floor: 0.3           # Global minimum load_mod for ALL workers (0 = disabled)
+
   # --- Feature toggles (false = off, true = on) ---
-  enable_lints: true          # LinTS contextual bandit (ISL/OSL-aware exploration)
-  enable_affinity: true       # Prefix stickiness bonus for multi-turn sessions
-  enable_switching_cost: true # Penalty for migrating a prefix to a different worker
-  enable_full_load: true      # 5-param load model (gpu + queue + outstanding + coupling terms)
-  enable_adaptive_temp: true  # Temperature decays with reuse_after (greedier late in session)
-  enable_adaptive_explore: true # Beta-TS weight decays with reuse_after
-  enable_sticky_floor: false   # Protect sticky worker's load_mod minimum
-  # --- Feature-specific weights (only used when corresponding feature is enabled) ---
-  lints_weight: -1.0            # LinTS weight. Negative enables tanh normalization: -1.0 = tanh-bounded to [-1,1]. Positive = raw (can dominate other signals).
-  affinity_base: 0.15          # Base stickiness bonus. Absorbed former affinity_iat_weight (0.05×1.0) since
-                               # IAT is now a LinTS feature only — not a coefficient in affinity/switch scores.
-  affinity_reuse_weight: 0.02  # Additional bonus per remaining request (was 0.08 — dominated queue penalty at reuse_after>=3)
-  switch_base: 0.04            # Base switching penalty. Absorbed former switch_iat (0.01×1.0) for same reason.
-  switch_reuse: 0.01           # Additional penalty per remaining request (was 0.04)
-  sticky_load_floor: 0.01      # Minimum load_mod for sticky worker (enable_sticky_floor)
-  load_mod_floor: 0.3          # Global minimum load_mod for ALL workers. Prevents KV overlap signal
-                               # from being erased when all workers have deep queues (load_mod≈0).
-                               # At floor=0.1: overlap=0.95 still scores 5x higher than overlap=0.20
-                               # even at queue depth 50+. Set to 0 to disable (original behavior).
-  adaptive_temp_base: 1.0      # Base temperature before decay (enable_adaptive_temp)
+  # All default to false when not present, preserving base-only behavior.
+  enable_softmax: false         # Softmax probabilistic selection (false = deterministic argmax)
+  enable_cold_start: false      # Round-robin when all overlaps below cold_start_threshold
+  enable_idle_boost: false      # Apply idle_boost floor to overlap scores
+  enable_load_mod_floor: false  # Apply load_mod_floor to prevent KV signal erasure
+  enable_lints: true            # LinTS contextual bandit (7-dim feature-aware exploration)
+  enable_affinity: false        # Prefix stickiness bonus for multi-turn sessions
+  enable_switching_cost: false  # Penalty for migrating a prefix to a different worker
+  enable_adaptive_temp: false   # Temperature decays with session depth (greedier late in session)
+  enable_adaptive_explore: false # Beta-TS weight decays with session depth
+  enable_sticky_floor: false    # Protect sticky worker's load_mod minimum
+
+  # --- Feature-specific weights (only used when corresponding toggle is enabled) ---
+  lints_weight: -1.0            # LinTS weight. Negative = tanh-bounded to [-1,1]. Positive = raw. [optimizable: -2.0..2.0]
+  affinity_base: 0.15           # Base stickiness bonus (enable_affinity)
+  affinity_reuse_weight: 0.02   # Additional bonus per remaining request (enable_affinity)
+  switch_base: 0.04             # Base switching penalty (enable_switching_cost)
+  switch_reuse: 0.01            # Additional penalty per remaining request (enable_switching_cost)
+  sticky_load_floor: 0.01       # Minimum load_mod for sticky worker (enable_sticky_floor)
+  adaptive_temp_base: 1.0       # Base temperature before decay (enable_adaptive_temp)
 
 # Debug settings
 debug:
   traces_enabled: false                     # Enable debug trace logging
   trace_dir: /tmp/dynamo_router_traces      # Directory for trace files
   buffer_size: 2000                         # In-memory trace buffer size
-

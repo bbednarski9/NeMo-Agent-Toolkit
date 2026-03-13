@@ -651,9 +651,8 @@ docker run -d \
     #
     # Order:
     #   1. Workers (model=${SERVED_MODEL_NAME}-internal, not discovered for public model)
-    #   2. Router (needs workers to be present)
-    #   3. Processor (model=${SERVED_MODEL_NAME}, frontend discovers this)
-    #   4. Frontend (routes ${SERVED_MODEL_NAME} requests to processor ONLY)
+    #   2. Processor + KvThompsonRouter (model=${SERVED_MODEL_NAME}, in-process routing)
+    #   3. Frontend (routes ${SERVED_MODEL_NAME} requests to processor ONLY)
     # =========================================================================
 
     echo '========================================================='
@@ -808,23 +807,7 @@ docker run -d \
 
     echo ''
     echo '========================================================='
-    echo 'Step 2: Starting Custom Router (Thompson Sampling + Prometheus)...'
-    echo '========================================================='
-    # Router uses config.yaml for all parameters
-    # It needs workers to be present (started in Step 1)
-    # DYN_SYSTEM_PORT sets the Prometheus metrics port for this component
-    DYN_SYSTEM_PORT=\$ROUTER_METRICS_PORT \
-    python3 /workspace/custom_dynamo/$ROUTER_SCRIPT \
-      --config /workspace/custom_dynamo/config.yaml &
-    ROUTER_PID=\$!
-    echo \"Router PID: \$ROUTER_PID\"
-    echo \"Metrics at: http://localhost:\$ROUTER_METRICS_PORT/metrics\"
-    sleep 15
-    echo \"\"
-
-    echo ''
-    echo '========================================================='
-    echo 'Step 3: Starting Custom Processor (Static Mode)...'
+    echo 'Step 2: Starting Custom Processor + In-Process Router...'
     echo '========================================================='
     # STATIC MODE: Processor uses @dynamo_worker(static=True) so it registers
     # at dynamo.backend.generate WITHOUT an instance ID. This is required for
@@ -846,7 +829,7 @@ docker run -d \
 
     echo ''
     echo '========================================================='
-    echo 'Step 4: Starting Default Dynamo Frontend (Namespace-Scoped Discovery)...'
+    echo 'Step 3: Starting Default Dynamo Frontend (Namespace-Scoped Discovery)...'
     echo '========================================================='
     # NAMESPACE-SCOPED DISCOVERY: Frontend discovers backends via ETCD ModelWatcher,
     # but only from the 'dynamo' namespace. Workers are in the 'workers' namespace,
@@ -881,36 +864,32 @@ docker run -d \
         echo \"    Worker \$i: PID \${WORKER_PIDS[\$i]}, GPUs \$START_GPU-\$END_GPU\"
     done
     echo \"    → Registered at: workers.worker.generate (hidden from frontend)\"
-    echo \"  Router: PID \$ROUTER_PID  (Thompson Sampling + Prometheus)\"
-    echo \"    → Registered at: dynamo.router.{find_worker,feedback}\"
-    echo \"    → Metrics: http://localhost:\$ROUTER_METRICS_PORT/metrics\"
-    echo \"  Processor: PID \$PROCESSOR_PID  (NVExt annotation extraction)\"
-    echo \"    → Registered at: dynamo.backend.generate (STATIC mode)\"
+    echo \"  Processor + KvThompsonRouter: PID \$PROCESSOR_PID  (in-process Thompson Sampling)\"
+    echo \"    → Registered at: dynamo.backend.generate\"
+    echo \"    → Router management: http://localhost:8084 (GET/POST /state, /config, /health)\"
     echo \"    → Metrics: http://localhost:\$PROCESSOR_METRICS_PORT/metrics\"
     echo \"  Frontend: PID \$FRONTEND_PID  (Default Dynamo HTTP API on port $HTTP_PORT)\"
     echo \"    → Discovery: ETCD ModelWatcher\"
     echo \"    → Metrics: http://localhost:$HTTP_PORT/metrics\"
     echo ''
-    echo 'Request Flow (Dynamic Discovery - Thompson Sampling when routed to processor):'
+    echo 'Request Flow (In-Process Thompson Sampling):'
     echo '  Client → Default Frontend API (port $HTTP_PORT)'
     echo '         ↓ (tokenization + nvext parsing)'
-    echo '  Frontend routes via ETCD ModelWatcher (processor OR workers)'
+    echo '  Frontend routes via ETCD ModelWatcher'
     echo '         ↓'
-    echo '  IF routed to Processor (dynamo.backend.generate):'
+    echo '  Processor (dynamo.backend.generate)'
     echo '         ↓ (extract hints from annotations)'
-    echo '         ↓ (query Thompson Sampling router)'
-    echo '  Custom Router → worker_id'
-    echo '         ↓ (KV overlap + workload-aware selection)'
-    echo '  Processor routes to → workers.worker.generate (with worker_id)'
+    echo '         ↓ KvThompsonRouter.pick_worker() [in-process, no NATS RPC]'
+    echo '         ↓ (KV overlap via native KvRouter + Thompson Sampling)'
+    echo '  KvRouter.generate(worker_id=chosen) → workers.worker.generate'
     echo '         ↓'
-    echo '  vLLM Unified Worker (workers.worker.generate)'
+    echo '  vLLM Unified Worker'
     echo '         ↓'
-    echo '  Response + Feedback to Router'
+    echo '  Response → KvThompsonRouter.update_feedback() [inline learner update]'
     echo ''
     echo 'Prometheus Metrics Endpoints:'
     echo '  - Frontend:  http://localhost:$HTTP_PORT/metrics (latency, throughput)'
     echo '  - Workers:   http://localhost:\$WORKER_METRICS_PORT/metrics - \$((WORKER_METRICS_PORT + \${#WORKER_PIDS[@]} - 1))/metrics (KV cache)'
-    echo '  - Router:    http://localhost:\$ROUTER_METRICS_PORT/metrics (thompson_router_*)'
     echo '  - Processor: http://localhost:\$PROCESSOR_METRICS_PORT/metrics (thompson_* KVE)'
     echo '========================================================='
 
@@ -922,10 +901,6 @@ docker run -d \
         fi
         if ! kill -0 \$PROCESSOR_PID 2>/dev/null; then
             echo \"ERROR: Processor died!\"
-            exit 1
-        fi
-        if ! kill -0 \$ROUTER_PID 2>/dev/null; then
-            echo \"ERROR: Router died!\"
             exit 1
         fi
         for i in \$(seq 0 \$((\${#WORKER_PIDS[@]} - 1))); do
@@ -960,25 +935,22 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo ""
     echo "  Startup Order:"
     echo "    1. Workers     → model=${SERVED_MODEL_NAME}-internal (not matched by frontend)"
-    echo "    2. Router      → dynamo.router.{find_worker,feedback}"
-    echo "    3. Processor   → model=${SERVED_MODEL_NAME} (matched by frontend)"
-    echo "    4. Frontend    → routes to processor for ${SERVED_MODEL_NAME} requests"
+    echo "    2. Processor   → model=${SERVED_MODEL_NAME} (in-process KvThompsonRouter)"
+    echo "    3. Frontend    → routes to processor for ${SERVED_MODEL_NAME} requests"
     echo ""
     echo "  Request Flow (ALL requests go through processor):"
     echo "    Client Request (with nvext.annotations)"
     echo "      ↓"
     echo "    Default Dynamo Frontend (port $HTTP_PORT)"
     echo "      ↓ ETCD ModelWatcher (namespace=dynamo) routes to processor"
-    echo "    Custom Processor (dynamo.backend.generate)"
+    echo "    Custom Processor + KvThompsonRouter (dynamo.backend.generate)"
     echo "      ↓ extracts: prefix_id, total_requests, osl, iat"
-    echo "      ↓ queries Thompson Sampling router"
-    echo "    Custom Router → worker_id"
-    echo "      ↓ KV overlap + workload-aware selection"
-    echo "    Processor forwards to workers.worker.generate"
+    echo "      ↓ KvThompsonRouter.pick_worker() [in-process, no NATS RPC]"
+    echo "      ↓ KvRouter.generate(worker_id=chosen) → workers.worker.generate"
     echo "      ↓"
     echo "    vLLM Unified Workers ($NUM_WORKERS x TP=$TP_SIZE = $NUM_GPUS GPUs total)"
     echo "      ↓"
-    echo "    Response + Feedback Loop"
+    echo "    Response → KvThompsonRouter.update_feedback() [inline]"
     echo ""
     echo "Infrastructure Services (Managed):"
     echo "  ETCD: etcd-dynamo container, localhost:2379"
@@ -987,8 +959,7 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Prometheus Metrics Endpoints:"
     echo "  Frontend:  http://localhost:$HTTP_PORT/metrics (latency, throughput)"
     echo "  Workers:   http://localhost:$WORKER_METRICS_PORT/metrics - $((WORKER_METRICS_PORT + NUM_WORKERS - 1))/metrics (KV cache)"
-    echo "  Router:    http://localhost:$ROUTER_METRICS_PORT/metrics (routing)"
-    echo "  Processor: http://localhost:$PROCESSOR_METRICS_PORT/metrics (KVE)"
+    echo "  Processor: http://localhost:$PROCESSOR_METRICS_PORT/metrics (thompson_* KVE)"
     echo ""
     echo "Dynamo Components:"
     echo "  Frontend: HTTP API on port $HTTP_PORT"

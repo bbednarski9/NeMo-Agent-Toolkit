@@ -50,6 +50,8 @@ TUNABLE_PARAM_KEYS = [
     "beta_decay",
     "lints_v",
     "lints_forget_rate",
+    "queue_penalty_weight",
+    "lints_weight",
 ]
 
 

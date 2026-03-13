@@ -46,13 +46,7 @@ This guide covers setting up, running, and configuring the NVIDIA Dynamo backend
 
 ## Overview
 
-Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimization. The scope of the current integration is based around two core aspects. First, we have implemented a [Dynamo LLM](../../packages/nvidia_nat_core/src/nat/llm/dynamo_llm.py) support for NeMo Agent Toolkit inference on Dynamo runtimes. Second, we provide a set of startup scripts for NVIDIA Hopper and Blackwell GPU servers supporting NeMo Agent Toolkit runtimes at scale. The following **Table** defines each script:
-
-| Mode | Script | Description | Best For |
-|------|--------|-------------|----------|
-| **Unified** | `start_dynamo_unified.sh` | Workers responsible for both `prefill` and `decode` | Development, testing |
-| **Unified + Thompson** | `start_dynamo_unified_thompson_hints.sh` | Unified with a predictive KV-aware router | Production, KV optimization |
-| **Disaggregated** | `start_dynamo_disagg.sh` | Separate `prefill` and `decode` workers | High-throughput production |
+Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimization. The scope of the current integration is based around two core aspects. First, we have implemented a [Dynamo LLM](../../packages/nvidia_nat_core/src/nat/llm/dynamo_llm.py) support for NeMo Agent Toolkit inference on Dynamo runtimes. Second, we provide a set of startup scripts for Dynamo using VLLM and SgLang, supporting NeMo Agent Toolkit runtimes with the `nvext.agent_hints` and `nvext.cache_control` metadata for optimizing agentic performance on Dynamo servers. The following **Table** defines each script:
 
 ### Architecture Overview
 
@@ -61,16 +55,17 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
 │                     DYNAMO BACKEND ARCHITECTURE                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 
-
-                           CLIENT REQUEST
-                        (eval, curl, Python)
+                    NeMo Agent Toolkit Agent
+                    (DynamoLLM / _type: dynamo)
                                 │
                                 │  POST /v1/chat/completions
-                                │  Headers:
-                                │    x-prefix-id: react-bench-a1b2c3d4
-                                │    x-prefix-total-requests: 10
-                                │    x-prefix-osl: MEDIUM
-                                │    x-prefix-iat: MEDIUM
+                                │  Body includes:
+                                │    nvext.agent_hints:
+                                │      prefix_id, total_requests,
+                                │      osl, iat, latency_sensitivity,
+                                │      priority
+                                │    nvext.cache_control:
+                                │      type: "ephemeral", ttl
                                 │
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -84,40 +79,33 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
 │  │  • /v1/chat/completions    - Chat completion endpoint                  │  │
 │  │  • /v1/models              - List available models                     │  │
 │  │  • /health                 - Health check                              │  │
-│  │  • Extract x-prefix-* headers for router hints                         │  │
+│  │  • Rust nvext.rs parses body → AgentHints + CacheControl structs       │  │
+│  │  • --enable-cache-control activates pin_prefix flow                     │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                    │                                         │
 │                                    ▼                                         │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                         PROCESSOR                                      │  │
-│  │  ───────────────────────────────────────────────────────────────────── │  │
-│  │  • Tokenize messages → token_ids                                       │  │
-│  │  • Extract prefix hints from headers                                   │  │
-│  │  • Format engine request                                               │  │
-│  │  • Track prefix state (outstanding requests)                           │  │
-│  │  • CSV metrics logging                                                 │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
-│                                    │                                         │
-│                                    ▼                                         │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                          ROUTER                                        │  │
+│  │                        ROUTING LAYER                                   │  │
 │  │  ───────────────────────────────────────────────────────────────────── │  │
 │  │                                                                        │  │
-│  │  ┌──────────────────────┐  ┌──────────────────────────────────────┐    │  │
-│  │  │   Worker Selection   │  │    Thompson Sampling (Optional)      │    │  │
-│  │  │   ────────────────   │  │    ────────────────────────────────  │    │  │
-│  │  │   1. KV cache overlap│  │    • LinTS for continuous params     │    │  │
-│  │  │   2. Worker affinity │  │    • Beta bandits for discrete       │    │  │
-│  │  │   3. Load balancing  │  │    • Explores vs exploits workers    │    │  │
-│  │  │   4. OSL+IAT hints   │  │    • Learns optimal routing          │    │  │
-│  │  └──────────────────────┘  └──────────────────────────────────────┘    │  │
+│  │  ┌──────────────────────────┐  ┌──────────────────────────────────┐    │  │
+│  │  │  Built-in KV Router      │  │  Thompson Sampling Router       │    │  │
+│  │  │  (Rust/pyo3, default)    │  │  (components/, opt-in)          │    │  │
+│  │  │  ────────────────────    │  │  ──────────────────────────     │    │  │
+│  │  │  • Radix-tree KV match   │  │  • In-process via pyo3 KvRouter│    │  │
+│  │  │  • Load-aware scoring    │  │  • LinTS + Beta bandits         │    │  │
+│  │  │  • AgentHints.osl        │  │  • KV overlap + workload hints  │    │  │
+│  │  │  • AgentHints.priority   │  │  • Session affinity tracking    │    │  │
+│  │  │  • AgentHints.latency_   │  │  • Global EMA reward baseline   │    │  │
+│  │  │    sensitivity           │  │  • Learns optimal routing       │    │  │
+│  │  └──────────────────────────┘  └──────────────────────────────────┘    │  │
 │  │                                                                        │  │
-│  │  Routing Decision Factors:                                             │  │
-│  │  • overlap_score: KV cache reuse potential                             │  │
-│  │  • prefill_cost: Estimated prefill compute                             │  │
-│  │  • decode_cost: Based on OSL hint (LOW=1.0, MEDIUM=2.0, HIGH=3.0)      │  │
-│  │  • iat_factor: Stickiness based on IAT (LOW=1.5, MEDIUM=1.0, HIGH=2.0) │  │
-│  │  • load_modifier: Current worker queue depth                           │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐    │  │
+│  │  │  Future: Workload-Aware Router                                 │    │  │
+│  │  │  • Predictive scheduling using full agent_hints context        │    │  │
+│  │  │  • Deeper osl / iat / latency_sensitivity integration          │    │  │
+│  │  └────────────────────────────────────────────────────────────────┘    │  │
+│  │                                                                        │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                    │                                         │
 └────────────────────────────────────┼─────────────────────────────────────────┘
@@ -128,24 +116,22 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
         │                                                             │
         ▼                                                             ▼
 ┌─────────────────────────────┐                      ┌─────────────────────────────┐
-│    UNIFIED WORKER           │         OR           │    DISAGGREGATED WORKERS    │
-│    (GPUs 0,1,2,3, TP=4)     │                      │                             │
-│                             │                      │  ┌────────────────────────┐ │
-│  ┌───────────────────────┐  │                      │  │   PREFILL WORKER       │ │
-│  │  SGLang Engine        │  │                      │  │   (GPUs 0,1, TP=2)     │ │
-│  │  ─────────────────    │  │                      │  │   • Initial KV compute │ │
-│  │  • Model: Llama-3.3-70B  │                      │  │   • Sends KV via NIXL  │ │
-│  │  • KV Cache Management│  │                      │  └───────────┬────────────┘ │
-│  │  • Token Generation   │  │                      │              │              │
-│  │  • Streaming Support  │  │                      │              │ NIXL KV      │
-│  └───────────────────────┘  │                      │              │ Transfer     │
-│                             │                      │              ▼              │
-│  All operations in one      │                      │  ┌────────────────────────┐ │
-│  worker                     │                      │  │   DECODE WORKER        │ │
-│                             │                      │  │   (GPUs 2,3, TP=2)     │ │
-│                             │                      │  │   • Token generation   │ │
-│                             │                      │  │   • Streaming output   │ │
-│                             │                      │  └────────────────────────┘ │
+│    vLLM WORKER              │         OR           │    SGLang WORKER            │
+│    (Unified, TP=4)          │                      │    (Unified, TP=4)          │
+│                             │                      │                             │
+│  ┌───────────────────────┐  │                      │  ┌───────────────────────┐  │
+│  │  vLLM Engine          │  │                      │  │  SGLang Engine        │  │
+│  │  ─────────────────    │  │                      │  │  ─────────────────    │  │
+│  │  • Model inference    │  │                      │  │  • Model inference    │  │
+│  │  • KV Cache Management│  │                      │  │  • KV Cache Management│  │
+│  │  • Token Generation   │  │                      │  │  • Token Generation   │  │
+│  │  • Streaming Support  │  │                      │  │  • Streaming Support  │  │
+│  │  • Priority scheduling│  │                      │  │  • Priority scheduling│  │
+│  └───────────────────────┘  │                      │  └───────────────────────┘  │
+│                             │                      │                             │
+│  Cache Control:             │                      │  Cache Control:             │
+│  • pin_prefix on generate   │                      │  • pin_prefix on generate   │
+│  • TTL-based eviction       │                      │  • TTL-based eviction       │
 └─────────────────────────────┘                      └─────────────────────────────┘
         │                                                             │
         └─────────────────────────────┬───────────────────────────────┘
@@ -167,13 +153,36 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
 │  │   ETCD                 │         │   NATS                 │               │
 │  │   ──────────────────── │         │   ──────────────────── │               │
 │  │   • Worker discovery   │         │   • Message queue      │               │
-│  │   • Metadata storage   │         │   • Prefill requests   │               │
-│  │   • Health tracking    │         │   • JetStream enabled  │               │
-│  │   Port: 2379/2389      │         │   Port: 4222/4232      │               │
-│  └────────────────────────┘         └────────────────────────┘               │
+│  │   • Model card registry│         │   • Inter-component    │               │
+│  │   • Health tracking    │         │     messaging          │               │
+│  │   Port: 2379           │         │   • JetStream enabled  │               │
+│  └────────────────────────┘         │   Port: 4222           │               │
+│                                     └────────────────────────┘               │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### NeMo Agent Toolkit Agent Hints
+
+NeMo Agent Toolkit agents communicate workload characteristics to Dynamo through `nvext` fields in the OpenAI-compatible request body. These hints enable KV-aware routing, cache pinning, and priority scheduling. See [`components/NVEXT_FIELD_REFERENCE.md`](components/NVEXT_FIELD_REFERENCE.md) for the complete wire-format specification and config-to-wire mapping.
+
+#### `nvext.agent_hints`
+
+| Field | Description | Used in NAT Source/Components | Used in Dynamo Source/Components |
+|---|---|---|---|
+| `prefix_id` | Unique string identifying the KV cache prefix for a conversation | Yes — `DynamoPrefixContext` generates it; `processor.py` routes on it | No |
+| `total_requests` | Expected number of LLM calls in this conversation | Yes — `processor.py` computes `reuse_budget` from it | No |
+| `osl` | Expected output tokens (raw int or `LOW`/`MEDIUM`/`HIGH`) | Yes — `processor.py` uses it for router decode cost weighting. Validated for pass-through to Dynamo | Yes — native `AgentHints.osl` read by Dynamo's built-in frontend |
+| `iat` | Expected inter-arrival time in milliseconds (raw int or `LOW`/`MEDIUM`/`HIGH`) | Yes — `processor.py` uses it for router stickiness weighting. Validated for pass-through to Dynamo | No |
+| `latency_sensitivity` | How latency-sensitive this request is (from `@latency_sensitive` or prediction trie). Increase to prioritize a request. | Validated, passed through to Dynamo. Sets a context variable so we can decorate the context. | Yes — native `AgentHints.latency_sensitivity` → Dynamo queue ordering |
+| `priority` | Engine scheduling priority (`max_sensitivity - latency_sensitivity`) | Validated, passed through to Dynamo | Yes — native `AgentHints.priority` → engine queue, eviction, preemption |
+
+#### `nvext.cache_control`
+
+| Field | Description | Used in NAT Source/Components | Used in Dynamo Source/Components |
+|---|---|---|---|
+| `type` | Cache pinning strategy. Only valid value is `"ephemeral"`. Required in JSON (no serde default on deserialization). | `dynamo_llm.py`: Injected client-side via `CachePinType.EPHEMERAL` (default). Configurable via `cache_pin_type` param; set to `None` to disable cache control entirely. | `nvext.rs`: Deserialized into `CacheControlType` enum (single variant: `Ephemeral`). Presence of `cache_control` triggers `pin_prefix` after generation in the KV push router. Requires `--enable-cache-control` on the frontend. |
+| `ttl` | Duration string for how long to pin the prefix in the KV cache. Optional; defaults to `"5m"` (300s) when omitted. | `dynamo_llm.py`: Computed client-side as `total_requests * iat` (ms), converted to seconds, formatted as `"<N>m"` (whole minutes) or `"<N>s"`. The `iat` field is not consumed by Dynamo — it is only used here for this TTL computation and by the custom Thompson Sampling `processor.py`. | `nvext.rs` `CacheControl::ttl_seconds()`: Only parses `"5m"` (300s) and `"1h"` (3600s). Any other value logs a warning and falls back to 300s. The parsed TTL is forwarded as `ttl_seconds` to `pin_prefix` on the worker via the `cache_control` service mesh endpoint (`cache_control.rs` / `handler_base.py`). |
 
 ---
 
@@ -193,7 +202,7 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
 > - ❌ macOS (Intel or Apple Silicon)
 > - ❌ Windows
 >
-> You do **not** need to install `ai-dynamo` or `ai-dynamo-runtime` packages locally. The Dynamo server runs inside pre-built Docker images from NGC (`nvcr.io/nvidia/ai-dynamo/sglang-runtime`), which include all necessary components. The NeMo Agent Toolkit Dynamo LLM client (`_type: dynamo`) is a pure HTTP client that works on any platform.
+> You do **not** need to install `ai-dynamo` or `ai-dynamo-runtime` packages locally. The Dynamo server runs inside pre-built Docker images from NGC (`nvcr.io/nvidia/ai-dynamo/sglang-runtime`), which include all necessary components. By setting the environment variables `` and `` The NeMo Agent Toolkit Dynamo LLM client (`_type: dynamo`) is a pure HTTP client that works on any platform.
 
 ### Hardware Requirements
 
@@ -203,8 +212,6 @@ Dynamo is NVIDIA's high-performance LLM serving platform with KV cache optimizat
 | **GPU Count** | 2 GPUs for small models (2 workers) | 8 GPUs for optimal performance |
 | **GPU Memory** | 80GB per GPU (H100) | 192GB per GPU (B200) |
 | **System RAM** | 256GB | 512GB+ |
-
-> **Note**: The [Llama-3.3-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) model requires approximately 140GB of GPU memory when loaded with TP=4 (tensor parallelism across 4 GPUs). Ensure your GPU configuration has sufficient aggregate memory. If the Llama-3.3-70B-Instruct does not fit into your GPU memory, follow the same steps with the [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) for QA validation.
 
 ### Software Requirements
 
@@ -367,15 +374,18 @@ docker info
 
 Startup scripts can be found in the same directory (`NeMo-Agent-Toolkit/external/dynamo/`) at this `README.md`
 
-### Option 1: Unified Mode (Development)
+### Option 1: Default Rust Services (Development / Default)
 
-Single worker handling all operations. Simpler setup, good for development and testing.
+Unified worker with Dynamo's built-in Rust frontend, processor, and router. Supports round-robin and KV-aware routing out of the box. Simpler setup, good for development and testing.
 
 ```bash
 cd /path/to/NeMo-Agent-Toolkit/external/dynamo
 
-# Start Dynamo (do NOT use 'source')
-bash start_dynamo_unified.sh > startup_output.txt 2>&1
+# SGLang backend
+bash start_dynamo_unified_sglang.sh > startup_output.txt 2>&1
+
+# OR vLLM backend
+bash start_dynamo_unified_vllm.sh > startup_output.txt 2>&1
 
 # Wait for startup (watch GPU memory)
 watch -n 1 nvidia-smi
@@ -389,21 +399,30 @@ bash stop_dynamo.sh
 ```
 
 **Components started:**
-- `etcd` container (`etcd-dynamo`) on port 2389
-- `nats` container (`nats-dynamo`) on port 4232
-- Dynamo container (`dynamo-sglang`) with unified worker on GPUs 0,1,2,3 (TP=4)
+- `etcd` container (`etcd-dynamo`) on port 2379
+- `nats` container (`nats-dynamo`) on port 4222
+- Dynamo container (`dynamo-sglang` or `dynamo-vllm`) with unified worker
 
-**Startup time**: Startup time may vary between 5-20 minutes for a 70B model, depending on the state of the system cache.
+**Routing modes available:** round-robin (default), KV-aware (enable with `ENABLE_KV_AWARE_ROUTING=true` and `DYNAMO_ENABLE_KV_EVENTS=true` in `.env`)
 
-### Option 2: Unified + Thompson Sampling Router (Production)
+**Startup time**: Startup time may vary between 5-20 minutes for a 8-70B model, depending on the state of the system cache.
 
-Unified worker with custom predictive KV-aware router using Thompson Sampling for optimal request routing.
+### Option 2: pyo3 KV-Aware + Thompson Sampling Router (Production / Research)
+
+Unified worker with custom Python components that use pyo3 bindings to Dynamo's Rust KvRouter. Provides Thompson Sampling (LinTS + Beta bandits) for learning-based worker selection with KV overlap awareness, session affinity, and workload hints.
+
+**Router type selection:** Set `router_type` in `components/config.yaml` under `infrastructure:`:
+- `kv_native` — Dynamo's native KvRouter baseline (overlap + decode load scoring)
+- `kv_thompson_native` — Thompson Sampling with KvRouter lifecycle (LinTS + Beta bandits, learning-based)
 
 ```bash
 cd /path/to/NeMo-Agent-Toolkit/external/dynamo
 
-# Start Dynamo with Thompson Sampling router
-bash start_dynamo_unified_thompson_hints.sh > startup_output.txt 2>&1
+# SGLang backend with Thompson router
+bash start_dynamo_optimized_thompson_hints_sglang.sh > startup_output.txt 2>&1
+
+# OR vLLM backend with Thompson router
+bash start_dynamo_optimized_thompson_hints_vllm.sh > startup_output.txt 2>&1
 
 # Wait for startup
 watch -n 1 nvidia-smi
@@ -416,49 +435,33 @@ bash stop_dynamo.sh
 ```
 
 **Additional features:**
-- Custom frontend with prefix hint header support
-- Thompson Sampling router (LinTS + Beta bandits)
-- KV cache overlap optimization
-- Workload-aware routing based on OSL and IAT hints
+- In-process KV-aware routing via pyo3 Python bindings to Rust KvRouter
+- Thompson Sampling router (LinTS + Beta bandits) with learning-based worker selection
+- KV cache overlap optimization with session affinity tracking
+- Workload-aware routing based on `nvext.agent_hints` (osl, iat, latency_sensitivity)
+- Global EMA reward baseline for worker differentiation
 
-**Custom components location:** `generalized/`
-- `frontend.py` - Accepts x-prefix-* headers
-- `processor.py` - Forwards hints to router, CSV metrics logging
-- `router.py` - Thompson Sampling, KV overlap calculations
+**KvThompsonRouter feature vector (9 dimensions):**
 
-### Option 3: Disaggregated Mode (High-Throughput)
+The LinTS contextual bandit uses a 9-dimensional feature vector per worker, derived from native KvRouter load signals and request hints:
 
-Separate `prefill` and `decode` workers for maximum throughput. More complex setup.
+| Index | Feature | Formula | Source |
+|---|---|---|---|
+| 0 | bias | `1.0` | constant |
+| 1 | inv_load | `1 / (1 + decode_blocks / 50)` | KvRouter `get_potential_loads()` |
+| 2 | overlap | `1 - prefill_tokens / max(1, tokens_in)` | KvRouter `get_potential_loads()` |
+| 3 | affinity | `1.0` if same worker as last call, else `0.0` | prefix tracking |
+| 4 | outstanding_norm | `tanh(0.1 * decode_blocks)` | KvRouter `get_potential_loads()` |
+| 5 | decode_norm | `decode_cost(osl) / 3.0` | nvext hint (OSL interpolation: 128→1.0, 250→2.0, 1024→3.0) |
+| 6 | prefill_norm | `tanh(prefill_tokens / 1024)` | KvRouter `get_potential_loads()` |
+| 7 | iat_norm | `iat_factor(iat) / 1.5` | nvext hint (IAT interpolation: 50ms→1.5, 250ms→1.0, 1000ms→0.6) |
+| 8 | reuse_norm | `tanh(0.25 * reuse_budget)` | nvext hint |
 
-```bash
-cd /path/to/NeMo-Agent-Toolkit/external/dynamo
-
-export DYNAMO_PREFILL_GPUS=0,1
-export DYNAMO_DECODE_GPUS=2,3
-
-# Start Dynamo disaggregated
-bash start_dynamo_disagg.sh > startup_output.txt 2>&1
-
-# Wait for startup (both workers need to initialize)
-watch -n 1 nvidia-smi
-
-# Verify
-curl -sv http://localhost:8099/health
-
-# when testing is complete, shut down the containers with:
-bash stop_dynamo.sh
-```
-
-**Components started:**
-- `etcd` container on port 2379
-- `nats` container on port 4222
-- `prefill` Worker on GPUs 0,1 (TP=2)
-- `decode` Worker on GPUs 2,3 (TP=2)
-- Dynamo Frontend on port 8099
-
-**Startup time**: ~5 minutes (both workers must initialize)
-
-**Note**: Disaggregated mode uses NIXL for KV cache transfer between workers.
+**Custom components location:** `components/`
+- `config.yaml` - Thompson Sampling router configuration parameters
+- `processor.py` - Request handler with routing modes, extracts `nvext` hints
+- `router.py` - KvThompsonRouter class (in-process scoring, learner management HTTP server)
+- `learners.py` - BetaLearner, LinTSLearner, LatencyTracker
 
 ---
 
@@ -468,7 +471,8 @@ Instead of using pre-built NGC containers, you can build Dynamo runtime images d
 
 The startup scripts (`start_dynamo_optimized_thompson_hints_vllm.sh` and `start_dynamo_optimized_thompson_hints_sglang.sh`) support source-built images through two `.env` variables:
 
-- `DYNAMO_FROM_SOURCE=true` — enables source-build mode; forces use of `processor_multilru.py` and `router_multilru.py`
+- `DYNAMO_FROM_SOURCE=true` — enables source-build mode
+- `DYNAMO_SOURCE_DIR` — path to local Dynamo source for patching (e.g., `/path/to/dynamo`)
 - `DYNAMO_IMAGE` — the Docker image tag to build and use (for example, `dynamo-sglang-source:main`)
 
 Set these in your `.env` file:
@@ -754,7 +758,7 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 
 ## Dynamic Prefix Headers
 
-When using the Thompson Sampling router (`start_dynamo_unified_thompson_hints.sh`), dynamic prefix headers enable optimal KV cache management and request routing.
+When using the Thompson Sampling router (`start_dynamo_optimized_thompson_hints_sglang.sh` or `start_dynamo_optimized_thompson_hints_vllm.sh`), dynamic prefix headers enable optimal KV cache management and request routing.
 
 ### Overview
 
@@ -897,8 +901,8 @@ export DYNAMO_MODEL_DIR=/path/to/models/Llama-3.3-70B-Instruct
 export DYNAMO_GPU_DEVICES=0,1,2,3
 export DYNAMO_HTTP_PORT=8099
 
-# Then start Dynamo
-bash start_dynamo_unified.sh
+# Then start Dynamo (SGLang or vLLM)
+bash start_dynamo_unified_sglang.sh
 ```
 
 ### Script Variables
@@ -906,7 +910,7 @@ bash start_dynamo_unified.sh
 Each startup script also has configurable variables at the top that can be edited directly:
 
 ```bash
-# start_dynamo_unified.sh
+# start_dynamo_unified_sglang.sh
 CONTAINER_NAME="dynamo-sglang"
 WORKER_GPUS="${DYNAMO_GPU_DEVICES:-0,1,2,3}"    # Override with env var or edit default
 TP_SIZE=4
@@ -930,7 +934,7 @@ Option 1: Use environment variable (recommended):
 
 ```bash
 export DYNAMO_GPU_DEVICES=0,1,2,3
-bash start_dynamo_unified.sh
+bash start_dynamo_unified_sglang.sh
 ```
 
 Option 2: Edit the script directly:
@@ -965,7 +969,7 @@ Option 1: Use environment variables:
 export DYNAMO_HTTP_PORT=8080
 export DYNAMO_ETCD_PORT=2379
 export DYNAMO_NATS_PORT=4222
-bash start_dynamo_unified.sh
+bash start_dynamo_unified_sglang.sh
 ```
 
 Option 2: Edit script directly:
@@ -980,7 +984,7 @@ NATS_PORT=4222
 
 ## Metrics CSV Files
 
-The Thompson Sampling router (`start_dynamo_unified_thompson_hints.sh`) produces three CSV files for monitoring and analysis. These files are located in `/workspace/metrics/` inside the container.
+The Thompson Sampling router (`start_dynamo_optimized_thompson_hints_sglang.sh` / `start_dynamo_optimized_thompson_hints_vllm.sh`) produces three CSV files for monitoring and analysis. These files are located in `/workspace/metrics/` inside the container.
 
 ### Accessing Metrics
 
@@ -1110,7 +1114,26 @@ docker ps | grep nats-dynamo
 docker logs nats-dynamo
 ```
 
-### Tokenizer Mismatch (Disaggregated Mode)
+### Workers Not Registering (0 / N Workers)
+
+**Symptom**: Startup stalls at `Workers registered: 0 / N` even though container logs show workers initialized successfully (e.g., `Registered endpoint 'generate' with shared TCP server`).
+
+**Cause**: `DYNAMO_WORKER_COMPONENT` mismatch. The startup script defaults to `backend`, but some Dynamo image versions register workers under the `worker` component name instead. The ETCD detection loop queries `v1/instances/workers/<component>/generate/` — if the component name doesn't match what workers actually register under, the count stays at 0.
+
+**Diagnose**: Check what component name workers actually registered under:
+```bash
+curl -s http://localhost:2379/v3/kv/range -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"key": "'$(echo -n "v1/instances/workers/" | base64 -w0)'", "range_end": "'$(echo -n "v1/instances/workers0" | base64 -w0)'", "keys_only": true}' \
+  | python3 -c "import sys,json,base64; d=json.load(sys.stdin); [print(base64.b64decode(kv['key']).decode()) for kv in d.get('kvs',[])]"
+```
+
+If keys show `workers/worker/generate/` instead of `workers/backend/generate/`, set in `.env`:
+```bash
+DYNAMO_WORKER_COMPONENT=worker
+```
+
+### Tokenizer Mismatch
 
 **Symptom**: `KeyError: 'token_ids'` or tokenizer errors
 
@@ -1118,7 +1141,7 @@ docker logs nats-dynamo
 ```bash
 bash stop_dynamo.sh
 # Wait a few seconds
-bash start_dynamo_unified.sh
+bash start_dynamo_unified_sglang.sh  # or start_dynamo_unified_vllm.sh
 ```
 
 ### Slow Model Loading
@@ -1136,35 +1159,30 @@ bash start_dynamo_unified.sh
 watch -n 1 nvidia-smi
 ```
 
-### Streaming Not Working (Disaggregated Mode)
-
-**Known Issue**: Disaggregated mode may have issues with streaming requests.
-
-**Workaround**: Use unified mode for streaming, or use non-streaming requests:
-```json
-{"stream": false}
-```
-
 ---
 
 ## File Structure
 
 ```text
-external/dynamo/                                # Dynamo backend
+external/dynamo/                                          # Dynamo backend
 │
-├── 📄 README.md                                # This file - Dynamo setup guide
-├── 📄 .env.example                              # Example environment variables
-├── 🔧 start_dynamo_unified.sh                  # Start Dynamo (unified mode)
-├── 🔧 start_dynamo_unified_thompson_hints.sh   # Start with Thompson router
-├── 🔧 start_dynamo_disagg.sh                   # Start Dynamo (disaggregated)
-├── 🔧 stop_dynamo.sh                           # Stop all Dynamo services
-├── 🔧 test_dynamo_integration.sh               # Integration tests
-├── 🔧 monitor_dynamo.sh                        # Monitor running services
+├── 📄 README.md                                          # This file - Dynamo setup guide
+├── 📄 .env.example                                        # Example environment variables
+├── 🔧 start_dynamo_unified_sglang.sh                    # SGLang + Rust services (round-robin / KV-aware)
+├── 🔧 start_dynamo_unified_vllm.sh                      # vLLM + Rust services (round-robin / KV-aware)
+├── 🔧 start_dynamo_optimized_thompson_hints_sglang.sh   # SGLang + pyo3 KV-aware + Thompson router
+├── 🔧 start_dynamo_optimized_thompson_hints_vllm.sh     # vLLM + pyo3 KV-aware + Thompson router
+├── 🔧 stop_dynamo.sh                                    # Stop all Dynamo services
+├── 🔧 test_dynamo_integration.sh                        # Integration tests
+├── 🔧 monitor_dynamo.sh                                 # Monitor running services
 │
-└── 📁 generalized/                             # Custom router components
-    ├── frontend.py                             # Prefix header extraction
-    ├── processor.py                            # Request processing + metrics
-    └── router.py                               # Thompson Sampling router
+└── 📁 components/                                        # Custom router components
+    ├── processor.py                                     # Request handler with routing modes
+    ├── router.py                                        # Thompson Sampling router (NATS RPC)
+    ├── learners.py                                      # BetaLearner, LinTSLearner, LatencyTracker
+    ├── kv_indexer.py                                    # KV cache overlap scoring (RadixTree)
+    ├── config.yaml                                      # Router configuration parameters
+    └── NVEXT_FIELD_REFERENCE.md                         # nvext wire-format specification
 ```
 
 ---
@@ -1175,9 +1193,10 @@ external/dynamo/                                # Dynamo backend
 
 | Command | Description |
 |---------|-------------|
-| `bash start_dynamo_unified.sh` | Start unified mode |
-| `bash start_dynamo_unified_thompson_hints.sh` | Start with Thompson router |
-| `bash start_dynamo_disagg.sh` | Start disaggregated mode |
+| `bash start_dynamo_unified_sglang.sh` | SGLang + Rust services (round-robin / KV-aware) |
+| `bash start_dynamo_unified_vllm.sh` | vLLM + Rust services (round-robin / KV-aware) |
+| `bash start_dynamo_optimized_thompson_hints_sglang.sh` | SGLang + pyo3 KV-aware + Thompson router |
+| `bash start_dynamo_optimized_thompson_hints_vllm.sh` | vLLM + pyo3 KV-aware + Thompson router |
 | `bash stop_dynamo.sh` | Stop all services |
 | `./test_dynamo_integration.sh` | Run integration tests |
 | `./monitor_dynamo.sh` | Interactive monitoring |
@@ -1190,9 +1209,10 @@ external/dynamo/                                # Dynamo backend
 
 | Container | Description |
 |-----------|-------------|
-| `dynamo-sglang` | Standard Dynamo worker |
-| `etcd-dynamo` | Service discovery and metadata |
-| `nats-dynamo` | Message queue for `prefill` requests |
+| `dynamo-sglang` | SGLang Dynamo worker |
+| `dynamo-vllm` | vLLM Dynamo worker |
+| `etcd-dynamo` | Service discovery and model card registry |
+| `nats-dynamo` | Inter-component messaging |
 
 ### Related Documentation
 
