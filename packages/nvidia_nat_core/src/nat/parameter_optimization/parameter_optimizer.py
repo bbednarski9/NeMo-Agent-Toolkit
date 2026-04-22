@@ -45,27 +45,43 @@ logger = logging.getLogger(__name__)
 
 # Mapping from NAT config field names to router management API field names
 _ROUTER_PARAM_MAP = {
-    "router_ts_weight": "ts_weight",
-    "router_temperature": "temperature",
-    "router_cold_start_threshold": "cold_start_threshold",
-    "router_idle_boost": "idle_boost",
-    "router_beta_decay": "beta_decay",
-    "router_lints_v": "lints_v",
-    "router_lints_forget_rate": "lints_forget_rate",
-    "router_queue_penalty_weight": "queue_penalty_weight",
-    "router_lints_weight": "lints_weight",
+    "router_lambda_ranking": "lambda_ranking",
+    "router_lambda_stickiness": "lambda_stickiness",
+    "router_w_cache": "w_cache",
+    "router_w_queue": "w_queue",
+    "router_w_osl_load": "w_osl_load",
+    "router_w_sensitivity": "w_sensitivity",
+    "router_alpha_reuse": "alpha_reuse",
+    "router_sticky_bonus": "sticky_bonus",
+    "router_stickiness_overlap_cap": "stickiness_overlap_cap",
+    "router_epsilon": "epsilon",
 }
 
 
-def _push_router_config_and_reset(mgmt_url: str, suggestions: dict[str, Any]) -> None:
+def _push_router_config_and_reset(
+    mgmt_url: str,
+    suggestions: dict[str, Any],
+    base_cfg: Any = None,
+) -> None:
     """Push router tuning params and reset learner state before an optimization trial.
 
     Calls POST /state/reset then POST /config on the router/processor management
-    endpoint.  Silently logs warnings on failure (the optimizer continues).
+    endpoint.  Includes both trial suggestions AND fixed config values (e.g.
+    enable_* flags) from the base config.  Silently logs warnings on failure.
     """
     import json as _json
 
-    router_params = {}
+    router_params: dict[str, Any] = {}
+
+    # 1. Collect fixed config values (enable_* flags and other non-optimized params)
+    if base_cfg is not None:
+        for llm_cfg in getattr(base_cfg, 'llms', {}).values():
+            for nat_key, api_key in _ROUTER_PARAM_MAP.items():
+                value = getattr(llm_cfg, nat_key, None)
+                if value is not None:
+                    router_params[api_key] = value
+
+    # 2. Overlay trial suggestions (take precedence over fixed values)
     for nat_key, api_key in _ROUTER_PARAM_MAP.items():
         for sug_key, sug_val in suggestions.items():
             if sug_key.endswith(nat_key):
@@ -251,7 +267,7 @@ def optimize_parameters(
         # Push router tuning params and reset learner state before eval
         mgmt_url = _find_router_management_url(base_cfg)
         if mgmt_url:
-            _push_router_config_and_reset(mgmt_url, suggestions)
+            _push_router_config_and_reset(mgmt_url, suggestions, base_cfg=base_cfg)
 
         # Create tasks for all evaluations
         async def _run_all_evals():

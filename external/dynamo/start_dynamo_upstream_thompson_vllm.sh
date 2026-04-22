@@ -880,6 +880,13 @@ uvloop.run(worker())
     # so the frontend will ONLY discover the processor (in 'dynamo' namespace).
     # This ensures ALL requests go through the Thompson Sampling router.
     echo \"Frontend KV Block Size: $KV_BLOCK_SIZE tokens (must match worker --block-size)\"
+    # Override DYN_ROUTER_MIN_INITIAL_WORKERS=1 for the frontend.
+    # The container-wide value is set to NUM_WORKERS (for the Thompson router's
+    # KvRouter to wait for all vLLM workers), but the frontend only sees the
+    # single Thompson router processor at dynamo.backend.generate.  Without this
+    # override the frontend's engine pipeline times out after 120s waiting for
+    # NUM_WORKERS instances and the model is never registered — returning 404.
+    DYN_ROUTER_MIN_INITIAL_WORKERS=1 \
     python3 -m dynamo.frontend \
       --http-port $HTTP_PORT \
       --model-name $SERVED_MODEL_NAME \

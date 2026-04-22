@@ -58,6 +58,7 @@ nvext_prefix_total_requests
 import json
 import logging
 import threading
+import urllib.request
 import uuid
 import warnings
 from collections.abc import Iterator
@@ -358,78 +359,140 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
         "tuning params and resets learner state before each trial.",
     )
 
-    router_ts_weight: float = OptimizableField(
+    # =========================================================================
+    # ROUTER SCORING PARAMS: score(w) = λ₁ × ranking(w) + λ₂ × stickiness(w)
+    # =========================================================================
+
+    router_lambda_ranking: float = OptimizableField(
+        default=1.0,
+        ge=0.0,
+        le=5.0,
+        description="Weight on the ranking term (best worker for this request). "
+        "Higher = prioritize immediate latency over session-level cache locality.",
+        space=SearchSpace(low=0.1, high=3.0, step=0.1),
+    )
+
+    router_lambda_stickiness: float = OptimizableField(
         default=0.05,
         ge=0.0,
         le=1.0,
-        description="Beta-TS exploration weight in the Thompson Sampling router.",
-        space=SearchSpace(low=0.01, high=0.20, step=0.02),
+        description="Weight on the stickiness benefit (subtracted from cost). "
+        "Very sensitive — 0.05 optimal. >0.2 destroys worker evenness.",
+        space=SearchSpace(low=0.02, high=0.12, step=0.01),
+    )
+
+    router_w_prefill: float = OptimizableField(
+        default=1.0,
+        ge=0.0,
+        le=10.0,
+        description="Prefill cost weight in the ranking cost term (lower score = better). "
+        "Equivalent to native KV router's overlap_score_weight. "
+        "Higher = more strongly avoid workers that need prefill for this request.",
+        space=SearchSpace(low=0.5, high=1.5, step=0.1),
+    )
+
+    router_w_decode: float = OptimizableField(
+        default=1.0,
+        ge=0.0,
+        le=5.0,
+        description="Decode load weight in the ranking cost term. "
+        "Uses potential_decode_blocks from native KvRouter's in-process tracking. "
+        "Higher = more aggressively avoid workers with active decode blocks.",
+        space=SearchSpace(low=0.5, high=1.5, step=0.1),
+    )
+
+    router_w_mem: float = OptimizableField(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Memory pressure weight in the ranking cost term. "
+        "Higher = avoid workers with high KV cache utilization (eviction risk).",
+        space=SearchSpace(low=0.0, high=0.5, step=0.05),
     )
 
     router_temperature: float = OptimizableField(
-        default=0.30,
-        ge=0.01,
-        le=5.0,
-        description="Softmax temperature for worker selection (lower = greedier).",
-        space=SearchSpace(low=0.10, high=2.00, step=0.10),
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description="Softmax temperature for action selection. "
+        "0.0 = greedy argmin (deterministic). "
+        "Higher = more exploration (stochastic, favoring lower-cost workers).",
+        space=SearchSpace(low=0.0, high=1.0, step=0.1),
     )
 
-    router_cold_start_threshold: float = OptimizableField(
+    router_lambda_lints: float = OptimizableField(
         default=0.05,
         ge=0.0,
         le=1.0,
-        description="Minimum KV overlap to trust scoring (below = round-robin).",
-        space=SearchSpace(low=0.01, high=0.40, step=0.02),
-    )
-
-    router_idle_boost: float = OptimizableField(
-        default=0.02,
-        ge=0.0,
-        le=1.0,
-        description="Floor overlap for idle workers (prevents starvation).",
-        space=SearchSpace(low=0.005, high=0.20, step=0.01),
-    )
-
-    router_beta_decay: float = OptimizableField(
-        default=0.995,
-        ge=0.9,
-        le=1.0,
-        description="Beta learner exponential decay (0.98=window~50, 1.0=no forget).",
-        space=SearchSpace(low=0.950, high=1.000, step=0.005),
+        description="Weight on LinTS contextual bandit residual. "
+        "0.0 = disabled. Very sensitive — 0.05 optimal. "
+        "Constraint: lambda_stickiness + lambda_lints < 0.2.",
+        space=SearchSpace(low=0.02, high=0.12, step=0.01),
     )
 
     router_lints_v: float = OptimizableField(
         default=0.25,
         ge=0.01,
-        le=5.0,
-        description="LinTS posterior exploration variance.",
-        space=SearchSpace(low=0.01, high=1.00, step=0.05),
+        le=2.0,
+        description="LinTS posterior noise scale. Controls exploration width of the "
+        "contextual bandit. Higher = wider exploration.",
+        space=SearchSpace(low=0.1, high=0.75, step=0.05),
     )
 
     router_lints_forget_rate: float = OptimizableField(
         default=0.995,
         ge=0.9,
-        le=1.0,
-        description="LinTS exponential forgetting rate (lower = faster adaptation).",
-        space=SearchSpace(low=0.950, high=0.999, step=0.005),
+        le=0.9999,
+        description="LinTS exponential forgetting rate. Lower = adapts faster but forgets more. "
+        "0.99 = ~100 effective samples. 0.999 is too slow (68 TPS).",
+        space=SearchSpace(low=0.99, high=0.996, step=0.001),
     )
 
-    router_queue_penalty_weight: float = OptimizableField(
-        default=2.5,
+    router_alpha_reuse: float = OptimizableField(
+        default=0.5,
         ge=0.0,
-        le=10.0,
-        description="Exponential queue penalty: load_mod = exp(-qpw * decode_blocks² / 2500). "
-        "Higher values penalize loaded workers more aggressively.",
-        space=SearchSpace(low=0.5, high=5.0, step=0.25),
+        le=2.0,
+        description="Future workload awareness: modulates w_prefill by remaining reuse fraction. "
+        "Higher = more cache weighting for high-reuse prefixes.",
+        space=SearchSpace(low=0.25, high=1.0, step=0.05),
     )
 
-    router_lints_weight: float = OptimizableField(
-        default=-1.0,
-        ge=-5.0,
-        le=5.0,
-        description="LinTS contribution weight. Negative = tanh-bounded [-1,1], positive = raw. "
-        "Controls how much the contextual bandit influences worker selection.",
-        space=SearchSpace(low=-2.0, high=2.0, step=0.25),
+    router_sticky_bonus: float = OptimizableField(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="Extra bonus for the prefix's current worker in the stickiness term. "
+        "Higher = stronger preference to stay on the same worker.",
+        space=SearchSpace(low=0.0, high=1.0, step=0.05),
+    )
+
+    router_stickiness_overlap_cap: float = OptimizableField(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Cap on overlap contribution to stickiness future_value. "
+        "Limits how much more sticky a 99%-overlap worker is vs a 27%-overlap worker. "
+        "At 0.5, both cap at 0.5 future_value, reducing the stickiness gap. "
+        "At 1.0, no cap (original behavior).",
+        space=SearchSpace(low=0.2, high=1.0, step=0.1),
+    )
+
+    router_epsilon: float = OptimizableField(
+        default=0.1,
+        ge=0.0,
+        le=0.5,
+        description="Beta learner exploration magnitude on normalized scores. "
+        "0.1 = 10% of best-vs-worst gap. Sweet spot confirmed at 0.1.",
+        space=SearchSpace(low=0.05, high=0.15, step=0.01),
+    )
+
+    router_reward_ttft_weight: float = OptimizableField(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Reward blend between per-token latency (TPS) and total latency (TTFT). "
+        "0.0 = pure TPS optimization. 1.0 = pure TTFT optimization.",
+        space=SearchSpace(low=0.0, high=0.5, step=0.1),
     )
 
     nvext_prediction_trie_path: str | None = Field(
@@ -529,15 +592,20 @@ class DynamoModelConfig(OpenAIModelConfig, name="dynamo"):
             "nvext_cache_control_mode",
             "nvext_max_sensitivity",
             "router_management_url",
-            "router_ts_weight",
-            "router_temperature",
-            "router_cold_start_threshold",
-            "router_idle_boost",
-            "router_beta_decay",
+            "router_lambda_ranking",
+            "router_lambda_stickiness",
+            "router_lambda_lints",
             "router_lints_v",
             "router_lints_forget_rate",
-            "router_queue_penalty_weight",
-            "router_lints_weight",
+            "router_w_prefill",
+            "router_w_decode",
+            "router_w_mem",
+            "router_temperature",
+            "router_alpha_reuse",
+            "router_sticky_bonus",
+            "router_stickiness_overlap_cap",
+            "router_epsilon",
+            "router_reward_ttft_weight",
         })
 
 
@@ -864,6 +932,93 @@ def create_httpx_client_with_dynamo_hooks(
 
 
 # =============================================================================
+# ROUTER CONFIG PUSH (resets learner state + pushes config from YAML)
+# =============================================================================
+
+# Mapping from NAT config field names to router management API field names.
+# Kept in sync with nat.parameter_optimization.parameter_optimizer._ROUTER_PARAM_MAP.
+_ROUTER_PARAM_MAP: dict[str, str] = {
+    "router_lambda_ranking": "lambda_ranking",
+    "router_lambda_stickiness": "lambda_stickiness",
+    "router_lambda_lints": "lambda_lints",
+    "router_lints_v": "lints_v",
+    "router_lints_forget_rate": "lints_forget_rate",
+    "router_w_prefill": "w_prefill",
+    "router_w_decode": "w_decode",
+    "router_w_mem": "w_mem",
+    "router_temperature": "temperature",
+    "router_alpha_reuse": "alpha_reuse",
+    "router_sticky_bonus": "sticky_bonus",
+    "router_stickiness_overlap_cap": "stickiness_overlap_cap",
+    "router_epsilon": "epsilon",
+    "router_reward_ttft_weight": "reward_ttft_weight",
+}
+
+# Track which management URLs have already been pushed to in this process,
+# so concurrent LLM configs pointing at the same router don't reset each other.
+_pushed_mgmt_urls: set[str] = set()
+_pushed_mgmt_urls_lock = threading.Lock()
+
+
+def _push_router_config_on_init(config: "DynamoModelConfig") -> None:
+    """Push router tuning params from config and reset learner state.
+
+    Called once per unique ``router_management_url`` when the Dynamo LLM
+    provider is registered. This ensures that eval/benchmark runs (not just
+    optimizer trials) use the router params specified in the YAML config.
+
+    Steps:
+        1. POST ``/state/reset`` — clears stale Beta-TS / LinTS learner state.
+        2. POST ``/config``       — pushes the new tuning parameters.
+    """
+    mgmt_url = config.router_management_url
+    if not mgmt_url:
+        return
+
+    mgmt_url = mgmt_url.rstrip("/")
+
+    with _pushed_mgmt_urls_lock:
+        if mgmt_url in _pushed_mgmt_urls:
+            logger.debug("Router config already pushed to %s, skipping.", mgmt_url)
+            return
+        _pushed_mgmt_urls.add(mgmt_url)
+
+    # Collect router params that differ from None / are explicitly set
+    router_params: dict[str, float | bool] = {}
+    for nat_key, api_key in _ROUTER_PARAM_MAP.items():
+        value = getattr(config, nat_key, None)
+        if value is not None:
+            router_params[api_key] = value
+
+    if not router_params:
+        logger.debug("No router params to push for %s.", mgmt_url)
+        return
+
+    # 1. Reset learner state
+    try:
+        req = urllib.request.Request(
+            f"{mgmt_url}/state/reset", method="POST",
+            data=b"", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info("Router learner state reset: %s", resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to reset router state at %s: %s", mgmt_url, e)
+
+    # 2. Push config
+    try:
+        payload = json.dumps(router_params).encode()
+        req = urllib.request.Request(
+            f"{mgmt_url}/config", method="POST",
+            data=payload, headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info("Router config pushed on init: %s → %s", router_params, resp.read().decode())
+    except Exception as e:
+        logger.warning("Failed to push router config to %s: %s", mgmt_url, e)
+
+
+# =============================================================================
 # PROVIDER REGISTRATION
 # =============================================================================
 # Note: Client registrations for each framework (LangChain, LlamaIndex, etc.)
@@ -873,6 +1028,9 @@ def create_httpx_client_with_dynamo_hooks(
 @register_llm_provider(config_type=DynamoModelConfig)
 async def dynamo_llm(config: DynamoModelConfig, _builder: Builder):
     """Register the Dynamo LLM provider."""
+    # Push router config + reset learner state (once per management URL)
+    _push_router_config_on_init(config)
+
     yield LLMProviderInfo(
         config=config,
         description="A Dynamo-optimized model with automatic nvext.agent_hints injection for KV cache management.",
